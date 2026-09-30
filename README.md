@@ -38,6 +38,8 @@ API o1 tidak pernah menandatangani atau broadcast apa pun; bot yang melakukannya
 4. **Wallet launcher**: buat wallet **khusus** untuk bot ini (jangan wallet utamamu) dan isi dana secukupnya
    untuk *creation fee*, *gas*, dan dev buy. Contoh fee saat ini: 0,001 ETH di Base/Robinhood, 0,003 BNB di BSC,
    0,02 OKB di X Layer, 100 MON di Monad, 2 USDC native di Arc. Bot membaca fee live dari o1 dan menampilkannya di Review.
+   Simpan di wallet ini **hanya dana native** yang memang akan dipakai. Jangan taruh token lain di sana, dan pindahkan
+   atau jual token hasil dev buy secara berkala: makin sedikit yang ada di hot wallet, makin kecil yang bisa hilang.
 5. **RPC**: Base, BSC, X Layer, dan Monad punya RPC publik bawaan (ada rate limit; untuk serius pakai RPC pribadi).
    Robinhood Chain dan Arc harus kamu isi sendiri (`RPC_URL_4663`, `RPC_URL_5042`).
 
@@ -48,7 +50,8 @@ seharusnya masuk ke sana, dan bot perlu hidup terus-menerus.
 
 ### Di VPS (disarankan)
 
-Butuh VPS Linux dengan systemd (Debian/Ubuntu/RHEL dan turunannya). Login lewat SSH, lalu:
+Butuh VPS Linux dengan systemd (Debian/Ubuntu/RHEL dan turunannya) dan `git`
+(`sudo apt-get install -y git` di Debian/Ubuntu, `sudo dnf install -y git` di RHEL/Fedora). Login lewat SSH, lalu:
 
 ```bash
 git clone https://github.com/fdlr28/o1Launchtele.git
@@ -195,6 +198,10 @@ Kalau dev buy gagal, launch-nya tetap sukses dan bot memberitahumu.
   (pair dan token fee) dibaca dari kontrak tokennya dan harus cocok dengan klaim API; alamat token ditampilkan di Review.
   Ada juga batas mutlak creation fee per chain (kira-kira 10x fee o1 sekarang) dan batas biaya gas; keduanya bisa dinaikkan
   dengan `MAX_CREATION_FEE_<chainId>` / `MAX_GAS_COST_<chainId>` setelah kamu memverifikasi bahwa naiknya memang wajar.
+- **Fee dalam token ditolak secara bawaan.** o1 sejauh ini hanya memungut creation fee dalam mata uang native chain
+  (`/config` yang mengklaim fee dalam token lain adalah tanda bahaya: nama dan simbol token itu datang dari API). Bot hanya
+  menerimanya bila alamat token itu kamu daftarkan di `ALLOWED_FEE_TOKENS` setelah kamu verifikasi sendiri. Untuk pair native,
+  desimal dari API tidak boleh melebihi desimal mata uang native chain (supaya jumlah dev buy tidak membengkak).
 - **Review terikat ke drafnya.** Konfirmasi hanya berlaku untuk draf yang persis sama dengan yang di-review; kalau ada yang
   diubah sesudahnya, kamu diminta Review ulang. Setiap upaya launch (sukses atau gagal) juga butuh Review baru.
 - **Satu draf = satu launch.** Draf yang launch-nya sudah terkirim atau berhasil tidak bisa diluncurkan lagi (akan
@@ -259,6 +266,8 @@ atau `1.0000` (desimal).
   Permit2 lebih dari 31 hari, atau approve tak terbatas ke router) ditolak, dan dev buy-nya dilaporkan gagal (launch-nya
   tetap sukses). Kalau hasil dev buy tidak jelas (swap terkirim tapi belum terkonfirmasi), bot **tidak** menyuruhmu membeli
   manual sebelum kamu mengecek hash-nya, supaya tidak beli dobel.
+- **Dev buy menaruh token di wallet bot.** Token hasil beli tetap di wallet sampai kamu memindahkannya; bot tidak menjualnya.
+  Pindahkan atau jual secara berkala supaya hot wallet tidak menyimpan nilai yang tidak perlu.
 - **Arc:** USDC di Arc punya dua antarmuka (native 18 desimal, ERC-20 6 desimal) dengan satu saldo. Launch dengan pair
   native USDC dan terutama dev buy di Arc **belum pernah diuji**; kalau bot menolak sesuatu di sana, itu disengaja
   (gagal dengan aman). Lapor saja, jangan dipaksa.
@@ -281,8 +290,9 @@ atau `1.0000` (desimal).
 | `Wallet bot masih punya N transaksi yang belum terkonfirmasi` | Tunggu sampai transaksi itu masuk (atau bereskan di explorer / aplikasi wallet), lalu coba lagi. |
 | `Biaya gas maksimum … melebihi batas keamanan` | RPC atau jaringan memberi harga gas tak wajar; tidak ada yang dikirim. Coba lagi nanti atau ganti RPC. |
 | `Creation fee … melebihi batas keamanan bot` | Fee dari API lebih dari ~10x fee o1 yang diketahui. Periksa pengumuman o1; kalau memang naik, set `MAX_CREATION_FEE_<chainId>` di `.env`. |
-| `Desimal … menurut API o1 … tidak cocok` | Angka desimal dari API berbeda dengan kontrak tokennya (atau mata uang native chain). Jangan dilewati; itu tanda data API yang salah. |
-| `… menjawab seperti kontrak token (ERC-20), bukan factory atau router` | Alamat tujuan dari `/config` ternyata sebuah token. Jangan dilewati; laporkan ke o1. |
+| `Desimal … menurut API o1 …` (tidak cocok / lebih besar) | Angka desimal dari API berbeda dengan kontrak tokennya (atau lebih besar dari mata uang native chain). Jangan dilewati; itu tanda data API yang salah. |
+| `O1 meminta creation fee dalam token …` | o1 biasanya memungut fee native, jadi bot menolak fee dalam token. Hanya bila kamu sudah memverifikasi token itu, isi `ALLOWED_FEE_TOKENS=<alamat>` di `.env`. |
+| `… menjawab seperti kontrak token (ERC-20), bukan factory atau router` | Alamat tujuan dari `/config` menjawab seperti sebuah token. Jangan dilewati; laporkan ke o1. Hanya bila kamu sudah memverifikasi bahwa alamat itu memang factory/router resmi o1, daftarkan di `EXTRA_ALLOWED_TARGETS`. |
 | `Permit2 yang dipakai chain ini … bukan Permit2 kanonis` | Dev buy dengan pair ERC-20 butuh Permit2 kanonis. Kalau kamu sudah memverifikasi alamat Permit2 chain itu, daftarkan di `EXTRA_ALLOWED_TARGETS`. |
 | `Riwayat launch tidak bisa dibaca` / `Folder data … tidak bisa ditulis` | Periksa izin folder `DATA_DIR` (di VPS: `/opt/o1launchtele/data`, milik user `o1bot`). Tanpa catatan riwayat bot menolak mengirim transaksi. |
 | `Draft berubah sejak Review` | Ada yang diubah setelah Review. Buka Review lagi lalu konfirmasi. |
@@ -320,7 +330,7 @@ test/                 # unit + alur bot + end-to-end proses nyata (lihat di bawa
 ### Status pengujian
 
 Lingkungan tempat bot ini dibangun **tidak punya akses ke Telegram, API o1, maupun jaringan blockchain**, jadi bot
-**belum pernah dijalankan ke layanan sungguhan**. Yang sudah diuji (`npm test`, 450+ test):
+**belum pernah dijalankan ke layanan sungguhan**. Yang sudah diuji (`npm test`, 540+ test):
 
 - Perhitungan tax dicocokkan dengan angka resmi di dokumentasi o1 (mis. 3% dengan split 60/40 → protocol 0,5%,
   creator 1,5%, dividen 1%).

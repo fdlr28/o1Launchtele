@@ -49,6 +49,7 @@ export function createHarness() {
     chainIds: [8453],
     devBuySlippageBps: 500,
     extraAllowedTargets: [],
+    allowedFeeTokens: [],
     maxGasCostWei: {},
     maxCreationFeeWei: {},
     dataDir,

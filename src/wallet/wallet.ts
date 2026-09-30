@@ -1,8 +1,10 @@
 import {
+  AbiDecodingDataSizeTooSmallError,
+  AbiDecodingZeroDataError,
   BaseError,
-  HttpRequestError,
+  ContractFunctionZeroDataError,
   RpcError,
-  TimeoutError,
+  RpcRequestError,
   TransactionNotFoundError,
   TransactionReceiptNotFoundError,
   createPublicClient,
@@ -140,13 +142,21 @@ const DEFINITE_REJECTION = new RegExp(
 const firstLine = (text: string | undefined): string => (text ?? '').split('\n')[0] ?? '';
 
 /**
- * The RPC could not be reached at all (network, timeout), as opposed to a node that answered. A JSON-RPC error
- * for a call is NOT treated as a transport failure: nodes report "this contract has no such function" with many
- * different codes, and the token probe is only one layer of several.
+ * True when a failed read means "this contract has no such function": the EVM call reverted, or the node answered
+ * with nothing (or with something that is not a number). Anything else (a transport failure, a rate limit, an
+ * internal error, a node that is behind) means we simply cannot tell, and the caller must not read that as "no".
+ * viem calls almost every failed eth_call "reverted", so what counts is what the node itself said.
  */
-function isTransportFailure(err: unknown): boolean {
-  if (!(err instanceof BaseError)) return true;
-  return !!err.walk((e) => e instanceof HttpRequestError || e instanceof TimeoutError);
+function saysNoSuchFunction(err: unknown): boolean {
+  if (!(err instanceof BaseError)) return false;
+  // (viem reports a JSON-RPC error with a standard code as an RpcError and any other code as an RpcRequestError.)
+  const rpc = err.walk((e) => e instanceof RpcError || e instanceof RpcRequestError) as (BaseError & { code?: number; details?: string }) | null;
+  if (rpc) {
+    const words = `${firstLine(rpc.shortMessage)} ${rpc.details ?? ''} ${firstLine(rpc.message)}`;
+    return rpc.code === 3 || /revert|invalid opcode|vm execution|execution error/i.test(words);
+  }
+  // the node answered successfully, but with nothing or with too little to be a number
+  return !!err.walk((e) => e instanceof ContractFunctionZeroDataError || e instanceof AbiDecodingZeroDataError || e instanceof AbiDecodingDataSizeTooSmallError);
 }
 
 /**
@@ -339,8 +349,8 @@ export class ViemWallet implements Wallet {
         await read();
         return true;
       } catch (err) {
-        if (isTransportFailure(err)) throw err; // cannot tell: the caller must not assume "no"
-        return false; // reverted, answered with nothing, or with something that is not a number: not implemented
+        if (saysNoSuchFunction(err)) return false;
+        throw err; // cannot tell: the caller must not assume "no"
       }
     };
     const decimals = await answers(() => pub.readContract({ address, abi: erc20Abi, functionName: 'decimals' }));

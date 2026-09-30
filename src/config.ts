@@ -18,6 +18,8 @@ export interface AppConfig {
   devBuySlippageBps: number;
   /** Contracts the owner explicitly trusts on top of those o1 publishes in /config (normally empty). */
   extraAllowedTargets: string[];
+  /** Tokens (lower-case addresses) the owner accepts as a creation fee; o1 charges native fees, so normally empty. */
+  allowedFeeTokens: string[];
   /** The owner's overrides (MAX_GAS_COST_<id>, MAX_CREATION_FEE_<id>, in native units) of the built-in ceilings, in wei. */
   maxGasCostWei: Record<number, bigint>;
   maxCreationFeeWei: Record<number, bigint>;
@@ -142,6 +144,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     if (isAddress(part, { strict: false })) extraAllowedTargets.push(part.toLowerCase());
     else errors.push(`EXTRA_ALLOWED_TARGETS berisi alamat yang tidak valid: "${brief(part)}".`);
   }
+  const allowedFeeTokens: string[] = [];
+  for (const part of (get('ALLOWED_FEE_TOKENS') ?? '').split(/[\s,]+/).filter(Boolean)) {
+    if (isAddress(part, { strict: false })) allowedFeeTokens.push(part.toLowerCase());
+    else errors.push(`ALLOWED_FEE_TOKENS berisi alamat yang tidak valid: "${brief(part)}".`);
+  }
   // The old opt-out is gone. "true" is what the bot does anyway, so a leftover line is harmless; anything else
   // would be an owner expecting a check to be off that no longer can be, and must not pass silently.
   const legacyStrict = get('STRICT_TARGETS');
@@ -168,6 +175,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     chainIds,
     devBuySlippageBps,
     extraAllowedTargets,
+    allowedFeeTokens,
     maxGasCostWei,
     maxCreationFeeWei,
     dataDir: get('DATA_DIR') ?? './data',

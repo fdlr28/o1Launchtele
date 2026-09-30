@@ -89,4 +89,12 @@ export function createLogger(
   };
 }
 
+/**
+ * console.error for the few messages printed outside the logger (startup failures): redacted with whatever secrets
+ * are known at that moment, so a third-party error text can never carry one to the terminal or the journal.
+ */
+export function makeErrorPrinter(secrets: () => readonly string[], sink: (line: string) => void = console.error): (...parts: unknown[]) => void {
+  return (...parts) => sink(redact(parts.map((p) => (p instanceof Error ? p.message : String(p))).join(' '), secrets()));
+}
+
 export const silentLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };

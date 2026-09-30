@@ -518,6 +518,7 @@ describe('review', () => {
     });
 
     it('shows the fee token address, and blocks a creation fee whose decimals lie', async () => {
+      h.config.allowedFeeTokens.push(USDC.toLowerCase());
       const cfg = configFor('tax');
       cfg.suites![0]!.creation_fee = { amount_raw: '5000000', currency: USDC, symbol: 'USDC', decimals: 6 };
       h.api.configs.tax = cfg;
@@ -535,6 +536,32 @@ describe('review', () => {
       await h.press('nav:review');
       expect(h.panelText()).toContain('Desimal creation fee menurut API o1 (24)');
       expect(h.hasButton('go:launch')).toBe(false);
+    });
+
+    it('blocks a creation fee in a token until the owner allows that token', async () => {
+      const cfg = configFor('tax');
+      cfg.suites![0]!.creation_fee = { amount_raw: '5000000', currency: USDC, symbol: 'USDC', decimals: 6 };
+      h.api.configs.tax = cfg;
+      await fillBasics();
+      await h.press('nav:review');
+      expect(h.panelText()).toContain('O1 meminta creation fee dalam token');
+      expect(h.panelText()).toContain(`ALLOWED_FEE_TOKENS=${USDC}`);
+      expect(h.hasButton('go:launch')).toBe(false);
+      h.config.allowedFeeTokens.push(USDC.toLowerCase());
+      await h.press('nav:review');
+      expect(h.panelText()).toContain('Creation fee: 5 USDC');
+      expect(h.hasButton('go:launch')).toBe(true);
+    });
+
+    it('takes the native currency from the chain table even when the API describes it differently', async () => {
+      const cfg = configFor('tax');
+      cfg.chain = { chain_id: 8453, name: 'Base', native_currency: { symbol: 'FAKE', decimals: 6 } };
+      h.api.configs.tax = cfg;
+      await fillBasics();
+      await h.press('nav:review');
+      expect(h.panelText()).toContain('Creation fee: 0.001 ETH');
+      expect(h.panelText()).not.toContain('FAKE');
+      expect(h.hasButton('go:launch')).toBe(true);
     });
 
     it('blocks a creation fee above the ceiling, and lets the owner raise the ceiling on purpose', async () => {
@@ -574,6 +601,7 @@ describe('review', () => {
   });
 
   it('checks the balance of an ERC-20 creation fee, and remembers its currency', async () => {
+    h.config.allowedFeeTokens.push(USDC.toLowerCase());
     const cfg = configFor('tax');
     cfg.suites![0]!.creation_fee = { amount_raw: '5000000', currency: USDC, symbol: 'USDC', decimals: 6 };
     h.api.configs.tax = cfg;

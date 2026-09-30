@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from 'node:net';
 import { Ajv2020 } from 'ajv/dist/2020.js';
 import addFormatsModule from 'ajv-formats';
+import { encodeFunctionData, erc20Abi } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { FEE_RAW } from './fakes.js';
 import { FACTORY, TOKEN, configFor } from './fixtures.js';
@@ -139,6 +140,10 @@ export class MockO1 {
   configHits = 0;
   /** Delays every /launches/prepare response (the real API uploads to IPFS and mines an address). */
   prepareDelayMs = 0;
+  /** The native creation fee in wei: reported by /config and required by the plans. */
+  feeRaw = FEE_RAW;
+  /** When set, /config reports the creation fee in this token instead of the native currency. */
+  feeToken: { address: string; symbol: string; decimals: number } | null = null;
   private server!: Server;
   private validate = (() => {
     const addFormats = ((addFormatsModule as unknown as { default?: unknown }).default ?? addFormatsModule) as (a: Ajv2020) => void;
@@ -158,7 +163,11 @@ export class MockO1 {
       if (req.method === 'GET' && url.pathname === '/v1/config') {
         this.configHits++;
         const product = url.searchParams.get('launch_product') === 'tax' ? 'tax' : 'non-tax';
-        return json(res, 200, { data: configFor(product), meta });
+        const cfg = configFor(product);
+        cfg.suites![0]!.creation_fee = this.feeToken
+          ? { amount_raw: this.feeRaw, currency: this.feeToken.address, symbol: this.feeToken.symbol, decimals: this.feeToken.decimals }
+          : { amount_raw: this.feeRaw, currency: '0x0000000000000000000000000000000000000000', symbol: 'ETH', decimals: 18 };
+        return json(res, 200, { data: cfg, meta });
       }
 
       if (req.method === 'POST' && url.pathname === '/v1/launches/prepare') {
@@ -178,13 +187,29 @@ export class MockO1 {
             expires_at: new Date(now + 30 * 60_000).toISOString(),
             observed_block: '100',
             issues: [],
-            steps: [
-              {
-                id: 'create-launch', kind: 'transaction', label: 'Create launch', depends_on: [],
-                transaction: { chain_id: body.chain_id, from: body.creator, to: FACTORY, data: '0xabcdef12', value: FEE_RAW },
-                simulation: { status: 'succeeded', block_number: '100' },
-              },
-            ],
+            steps: this.feeToken
+              ? [
+                  {
+                    id: 'approve-fee', kind: 'transaction', label: 'Approve the creation fee', depends_on: [],
+                    transaction: {
+                      chain_id: body.chain_id, from: body.creator, to: this.feeToken.address, value: '0',
+                      data: encodeFunctionData({ abi: erc20Abi, functionName: 'approve', args: [FACTORY, BigInt(this.feeRaw)] }),
+                    },
+                    simulation: { status: 'succeeded', block_number: '100' },
+                  },
+                  {
+                    id: 'create-launch', kind: 'transaction', label: 'Create launch', depends_on: ['approve-fee'],
+                    transaction: { chain_id: body.chain_id, from: body.creator, to: FACTORY, data: '0xabcdef12', value: '0' },
+                    simulation: { status: 'succeeded', block_number: '100' },
+                  },
+                ]
+              : [
+                  {
+                    id: 'create-launch', kind: 'transaction', label: 'Create launch', depends_on: [],
+                    transaction: { chain_id: body.chain_id, from: body.creator, to: FACTORY, data: '0xabcdef12', value: this.feeRaw },
+                    simulation: { status: 'succeeded', block_number: '100' },
+                  },
+                ],
             predicted_token_address: TOKEN,
             suite_id: 'e2e',
             metadata_uri: 'ipfs://meta',

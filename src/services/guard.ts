@@ -1,4 +1,4 @@
-import { getAddress, isAddress, isHex, zeroAddress, type Address, type Hex } from 'viem';
+import { getAddress, isAddress, isHex, toFunctionSelector, zeroAddress, type Address, type Hex } from 'viem';
 import { UserFacingError } from '../errors.js';
 import { sameAddress } from '../o1/swap.js';
 import type { ContractSuite, TransactionRequest, TypedDataRequest } from '../o1/types.js';
@@ -81,29 +81,43 @@ const APPROVE_SELECTOR = '0x095ea7b3';
 const APPROVE_CALLDATA_LENGTH = 2 + 8 + 64 + 64;
 
 /**
- * Functions that move, spend or authorise tokens. The call that launches a token or swaps for it starts with
- * its own function (createLaunch, execute, ...), never with one of these, so a call that does is a token being
- * emptied through a contract /config merely CALLED the factory or a router.
+ * Functions that move, spend or authorise tokens, or pull funds out of a position. The call that launches a token
+ * or swaps for it starts with its own function (createLaunch, execute, ...), never with one of these, so a call
+ * that does is a wallet being emptied through a contract /config merely CALLED the factory or a router.
+ * (Selectors are derived from the signatures, so none is typed by hand.)
  */
-const TOKEN_MOVING_SELECTORS: ReadonlyMap<string, string> = new Map([
-  ['0xa9059cbb', 'transfer'],
-  ['0x23b872dd', 'transferFrom'],
-  ['0x095ea7b3', 'approve'],
-  ['0x39509351', 'increaseAllowance'],
-  ['0xa457c2d7', 'decreaseAllowance'],
-  ['0x42842e0e', 'safeTransferFrom'],
-  ['0xb88d4fde', 'safeTransferFrom'],
-  ['0xf242432a', 'safeTransferFrom'],
-  ['0x2eb2c2d6', 'safeBatchTransferFrom'],
-  ['0xa22cb465', 'setApprovalForAll'],
-  ['0xd505accf', 'permit'],
-  ['0x42966c68', 'burn'],
-  ['0x79cc6790', 'burnFrom'],
-  ['0x4000aea0', 'transferAndCall'],
-  ['0x9bd9bbc6', 'send'],
-  ['0x36c78516', 'Permit2.transferFrom'],
-  ['0x87517c45', 'Permit2.approve'],
-]);
+const TOKEN_MOVING_SIGNATURES: ReadonlyArray<string> = [
+  // ERC-20 / ERC-721 / ERC-1155 / ERC-777 / ERC-677 / EIP-2612
+  'transfer(address,uint256)',
+  'transferFrom(address,address,uint256)',
+  'approve(address,uint256)',
+  'increaseAllowance(address,uint256)',
+  'decreaseAllowance(address,uint256)',
+  'safeTransferFrom(address,address,uint256)',
+  'safeTransferFrom(address,address,uint256,bytes)',
+  'safeTransferFrom(address,address,uint256,uint256,bytes)',
+  'safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)',
+  'setApprovalForAll(address,bool)',
+  'permit(address,address,uint256,uint256,uint8,bytes32,bytes32)',
+  'burn(uint256)',
+  'burnFrom(address,uint256)',
+  'transferAndCall(address,uint256,bytes)',
+  'send(address,uint256,bytes)',
+  // Permit2
+  'transferFrom(address,address,uint160,address)',
+  'approve(address,address,uint160,uint48)',
+  // positions that hold the wallet's money: WETH, Aave, ERC-4626 vaults, Compound
+  'withdraw(uint256)',
+  'withdraw(address,uint256,address)',
+  'withdraw(uint256,address,address)',
+  'redeem(uint256,address,address)',
+  'redeem(uint256)',
+  'redeemUnderlying(uint256)',
+];
+
+const TOKEN_MOVING_SELECTORS: ReadonlyMap<string, string> = new Map(
+  TOKEN_MOVING_SIGNATURES.map((signature) => [toFunctionSelector(signature).toLowerCase(), signature.slice(0, signature.indexOf('('))]),
+);
 
 /** A plan needs at most an approval or two plus the final call. */
 export const MAX_PLAN_STEPS = 4;

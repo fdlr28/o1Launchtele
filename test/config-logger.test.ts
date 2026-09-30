@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { ConfigError, configSecrets, loadConfig } from '../src/config.js';
 import { describeError, setErrorSanitizer } from '../src/errors.js';
-import { createLogger, redact, secretVariants, urlSecrets } from '../src/logger.js';
+import { createLogger, makeErrorPrinter, redact, secretVariants, urlSecrets } from '../src/logger.js';
 
 const KEY = `0x${'ab'.repeat(32)}`;
 const BOT = '123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw0';
@@ -112,6 +112,41 @@ describe('loadConfig', () => {
     const b = '0xAbCdEf0123456789aBcDeF0123456789aBcDeF01';
     expect(loadConfig({ ...valid, EXTRA_ALLOWED_TARGETS: ` ${a}, ${b}` }).extraAllowedTargets).toEqual([a, b.toLowerCase()]);
     expect(errorOf({ ...valid, EXTRA_ALLOWED_TARGETS: `${a},0x12` })).toContain('EXTRA_ALLOWED_TARGETS berisi alamat yang tidak valid: "0x12"');
+  });
+});
+
+describe('ALLOWED_FEE_TOKENS (round-3 review)', () => {
+  it('is empty by default and reads a list of addresses, lower-cased', () => {
+    expect(loadConfig(valid).allowedFeeTokens).toEqual([]);
+    const a = '0xAbCdEf0123456789aBcDeF0123456789aBcDeF01';
+    expect(loadConfig({ ...valid, ALLOWED_FEE_TOKENS: ` ${a}, 0x1111111111111111111111111111111111111111` }).allowedFeeTokens).toEqual([
+      a.toLowerCase(),
+      '0x1111111111111111111111111111111111111111',
+    ]);
+    expect(errorOf({ ...valid, ALLOWED_FEE_TOKENS: 'USDC' })).toContain('ALLOWED_FEE_TOKENS berisi alamat yang tidak valid: "USDC"');
+  });
+});
+
+describe('the redacting error printer (round-3 review)', () => {
+  it('redacts known secrets and secret-shaped text from everything printed outside the logger', () => {
+    const lines: string[] = [];
+    const print = makeErrorPrinter(() => secretVariants(KEY), (line) => lines.push(line));
+    print('fatal:', new Error(`boom with ${KEY} and ${API} and https://u:pw123@rpc.example/x?key=abc`), 'extra');
+    expect(lines).toHaveLength(1);
+    for (const secret of [KEY, KEY.slice(2), 'SuperSecretValue', 'pw123', 'key=abc']) expect(lines[0]).not.toContain(secret);
+    expect(lines[0]).toContain('boom with');
+    expect(lines[0]).toContain('extra');
+  });
+
+  it('picks up secrets that become known later (the printer is created before the config is loaded)', () => {
+    let known: string[] = [];
+    const lines: string[] = [];
+    const print = makeErrorPrinter(() => known, (line) => lines.push(line));
+    print(`early ${KEY}`);
+    known = secretVariants(KEY);
+    print(`late ${KEY}`);
+    expect(lines[0]).toContain(KEY); // nothing was known yet: only the patterns apply
+    expect(lines[1]).not.toContain(KEY);
   });
 });
 

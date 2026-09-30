@@ -36,6 +36,8 @@ export interface ReviewDeps {
   wallet: Wallet;
   /** The owner's override of the creation fee ceiling per chain (MAX_CREATION_FEE_<id>). */
   maxCreationFeeWei?: (chainId: number) => bigint | undefined;
+  /** Tokens the owner accepts as a creation fee (ALLOWED_FEE_TOKENS). */
+  allowedFeeTokens?: readonly string[];
   launcher: Pick<Launcher, 'pendingLaunches' | 'priorLaunch'>;
 }
 
@@ -47,7 +49,10 @@ export async function buildReview(deps: ReviewDeps, draft: Draft): Promise<Revie
   // A missing pair is reported once by draftProblems below.
   if (draft.quote) {
     try {
-      ctx = await resolveLaunchContext(deps.catalog, draft, { tokenDecimals: (token) => deps.wallet.erc20Decimals(draft.chainId, token) });
+      ctx = await resolveLaunchContext(deps.catalog, draft, {
+        tokenDecimals: (token) => deps.wallet.erc20Decimals(draft.chainId, token),
+        allowedFeeTokens: new Set((deps.allowedFeeTokens ?? []).map((a) => a.toLowerCase())),
+      });
     } catch (err) {
       problems.push(describeError(err));
     }

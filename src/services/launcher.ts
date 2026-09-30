@@ -102,6 +102,8 @@ export interface LauncherDeps {
   extraTargets?: readonly string[];
   /** Called when a launch that was pending turns out to have confirmed, reverted or vanished. */
   onSettled?: (entry: HistoryEntry, status: 'confirmed' | 'reverted' | 'failed') => void;
+  /** Tokens the owner accepts as a creation fee (ALLOWED_FEE_TOKENS). Empty by default: o1 charges native fees. */
+  allowedFeeTokens?: readonly string[];
   /** Most a native creation fee may be on a chain (wei). The API's own number is not trusted. Defaults to the chain table. */
   maxCreationFeeWei?: (chainId: number) => bigint | undefined;
   /** Longest one RPC question may take while the history is settled (a hung node must not stall every review). */
@@ -382,7 +384,11 @@ export class Launcher {
     if (prior) throw new DraftAlreadyLaunchedError(prior);
     await this.assertWalletIdle(chainId);
 
-    const ctx = await resolveLaunchContext(catalog, draft, { fresh: true, tokenDecimals: (token) => wallet.erc20Decimals(chainId, token) });
+    const ctx = await resolveLaunchContext(catalog, draft, {
+      fresh: true,
+      tokenDecimals: (token) => wallet.erc20Decimals(chainId, token),
+      allowedFeeTokens: new Set((this.deps.allowedFeeTokens ?? []).map((a) => a.toLowerCase())),
+    });
     if (!sameContracts(contractsOf(ctx.suite), job.reviewedContracts)) {
       throw new UserFacingError('Alamat kontrak o1 berubah sejak Review. Buka Review lagi, periksa alamatnya, lalu konfirmasi ulang.');
     }

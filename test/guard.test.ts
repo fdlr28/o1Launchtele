@@ -1,4 +1,4 @@
-import { encodeFunctionData, erc20Abi, getAddress, maxUint160, maxUint256, parseAbi, type Address } from 'viem';
+import { encodeFunctionData, erc20Abi, getAddress, maxUint160, maxUint256, parseAbi, toFunctionSelector, type Address } from 'viem';
 import { describe, expect, it } from 'vitest';
 import { UserFacingError } from '../src/errors.js';
 import {
@@ -221,6 +221,43 @@ describe('a call may never be aimed at a token (round-3 review, HIGH)', () => {
     expect(() => checkTx(tx({ to: DAI, data: transfer(ATTACKER), value: '0' }), launchPolicy({ suite: hostile }), 'x')).toThrow(/fungsi token \(transfer\)/);
     // an ordinary launch or router call does not start with one of them
     expect(checkTx(tx({ data: '0x3593564c00' }), launchPolicy(), 'x').kind).toBe('call');
+  });
+
+  it('also refuses the functions that pull money out of a position (WETH, Aave, ERC-4626, Compound)', () => {
+    const signatures = [
+      'withdraw(uint256)', 'withdraw(address,uint256,address)', 'withdraw(uint256,address,address)',
+      'redeem(uint256,address,address)', 'redeem(uint256)', 'redeemUnderlying(uint256)',
+    ];
+    for (const signature of signatures) {
+      const data = `${toFunctionSelector(signature)}${'00'.repeat(96)}` as `0x${string}`;
+      expect(() => checkTx(tx({ data, value: '0' }), launchPolicy(), 'x'), signature).toThrow(/fungsi token/);
+    }
+  });
+
+  it('refuses each function of the golden list (a list copied here on purpose: dropping an entry from the guard fails this)', () => {
+    const golden = [
+      'transfer(address,uint256)', 'transferFrom(address,address,uint256)', 'approve(address,uint256)',
+      'increaseAllowance(address,uint256)', 'decreaseAllowance(address,uint256)',
+      'safeTransferFrom(address,address,uint256)', 'safeTransferFrom(address,address,uint256,bytes)',
+      'safeTransferFrom(address,address,uint256,uint256,bytes)', 'safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)',
+      'setApprovalForAll(address,bool)', 'permit(address,address,uint256,uint256,uint8,bytes32,bytes32)',
+      'burn(uint256)', 'burnFrom(address,uint256)', 'transferAndCall(address,uint256,bytes)', 'send(address,uint256,bytes)',
+      'transferFrom(address,address,uint160,address)', 'approve(address,address,uint160,uint48)',
+      'withdraw(uint256)', 'withdraw(address,uint256,address)', 'withdraw(uint256,address,address)',
+      'redeem(uint256,address,address)', 'redeem(uint256)', 'redeemUnderlying(uint256)',
+    ];
+    for (const signature of golden) {
+      const data = `${toFunctionSelector(signature)}${'00'.repeat(128)}` as `0x${string}`;
+      expect(() => checkTx(tx({ data, value: '0' }), launchPolicy(), 'x'), `launch ${signature}`).toThrow(/fungsi token/);
+      expect(() => checkTx(tx({ to: ROUTER, data, value: '0' }), swapPolicy(), 'x'), `swap ${signature}`).toThrow(/fungsi token/);
+    }
+  });
+
+  it('every entry of the denylist really is the selector of its signature (none typed by hand)', () => {
+    for (const [signature, name] of [['transfer(address,uint256)', 'transfer'], ['approve(address,uint256)', 'approve'], ['safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)', 'safeBatchTransferFrom']] as const) {
+      const data = `${toFunctionSelector(signature)}${'00'.repeat(64)}` as `0x${string}`;
+      expect(() => checkTx(tx({ data, value: '0' }), launchPolicy(), 'x')).toThrow(new RegExp(`fungsi token \\(${name}\\)`));
+    }
   });
 
   it('refuses a call to the pair, the fee token, or any token named by the plan, even with an innocent-looking selector', () => {

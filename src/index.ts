@@ -6,7 +6,7 @@ import { createDownloader } from './bot/telegramFiles.js';
 import { chainName } from './chains.js';
 import { ConfigError, configSecrets, loadConfig, type AppConfig } from './config.js';
 import { setErrorSanitizer } from './errors.js';
-import { createLogger, redact } from './logger.js';
+import { createLogger, makeErrorPrinter, redact } from './logger.js';
 import { Catalog } from './o1/catalog.js';
 import { ApiError, O1Client } from './o1/client.js';
 import { pendingNotice, settledNotice } from './notices.js';
@@ -35,7 +35,7 @@ const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 
 /** Everything printed outside the logger goes through the same redaction, once the secrets are known. */
 let knownSecrets: string[] = [];
-const printError = (...parts: unknown[]) => console.error(redact(parts.map((p) => (p instanceof Error ? p.message : String(p))).join(' '), knownSecrets));
+const printError = makeErrorPrinter(() => knownSecrets);
 
 async function main(): Promise<void> {
   dotenv.config({ quiet: true });
@@ -112,6 +112,7 @@ async function main(): Promise<void> {
     log,
     extraTargets: config.extraAllowedTargets,
     maxCreationFeeWei: (chainId) => config.maxCreationFeeWei[chainId],
+    allowedFeeTokens: config.allowedFeeTokens,
     onSettled: (entry, status) => notifyOwners(settledNotice(entry, status, config.explorerUrls)),
   });
   if (config.extraAllowedTargets.length > 0) {

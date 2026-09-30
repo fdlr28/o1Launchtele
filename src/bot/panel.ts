@@ -185,6 +185,7 @@ export class Ui {
             wallet: this.deps.wallet,
             launcher: this.deps.launcher,
             maxCreationFeeWei: (chainId) => this.deps.config.maxCreationFeeWei[chainId],
+            allowedFeeTokens: this.deps.config.allowedFeeTokens,
           },
           draft,
         );

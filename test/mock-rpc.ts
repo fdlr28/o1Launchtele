@@ -30,6 +30,8 @@ export class MockRpc {
   sendCalls = 0;
   /** The node accepts the next transaction but the connection dies before the reply arrives. */
   dropNextSendReply = false;
+  /** Every eth_call is answered with this JSON-RPC error (a node that reverts, rate-limits, or has an internal error). */
+  callFault: { code: number; message: string } | null = null;
   /** The next eth_sendRawTransaction is refused with a JSON-RPC error. */
   failNextSend: { code: number; message: string } | null = null;
   /** ... but the node put the transaction in its pool anyway (a busy or load-balanced node answering with an error). */
@@ -174,6 +176,7 @@ export class MockRpc {
       case 'eth_getCode':
         return this.codeAddresses.has((params[0] as string).toLowerCase()) ? '0x6080' : '0x';
       case 'eth_call': {
+        if (this.callFault) throw this.callFault;
         const call = params[0] as { to?: string; data?: string; input?: string };
         const decimals = this.tokens.get((call.to ?? '').toLowerCase());
         if (decimals === undefined) return '0x';

@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { FEE_RAW, tempDir } from './fakes.js';
-import { FACTORY, TOKEN } from './fixtures.js';
+import { FACTORY, TOKEN, USDC } from './fixtures.js';
 import { API_KEY, BOT_TOKEN, MockO1, MockTelegram, OWNER, PRIVATE_KEY, WALLET } from './mock-servers.js';
 import { MockRpc } from './mock-rpc.js';
 import { PNG_BYTES } from './bot-harness.js';
@@ -225,6 +225,8 @@ async function boot(
     env?: Record<string, string>;
     /** Runs against the mock node before the bot starts. */
     prepare?: (rpc: MockRpc) => void;
+    /** Runs against the mock o1 API before the bot starts. */
+    configureO1?: (o1: MockO1) => void;
     /** False when the process is expected to leave before it ever polls Telegram. */
     waitForPolling?: boolean;
   } = {},
@@ -236,6 +238,7 @@ async function boot(
   rpc.codeAddresses.add(TOKEN.toLowerCase());
   o1.prepareDelayMs = opts.prepareDelayMs ?? 0;
   opts.prepare?.(rpc);
+  opts.configureO1?.(o1);
   const dataDir = tempDir();
   if (opts.seedHistory) writeFileSync(join(dataDir, 'launches.jsonl'), opts.seedHistory);
 
@@ -427,6 +430,71 @@ describe('end to end: shutdown and crash recovery (real process)', () => {
     expect(String(stack.tg.calls.find((c) => String(c.payload.text ?? '').includes('ternyata BERHASIL'))?.payload.text)).toContain('Down Coin');
     expect(stack.tg.calls.some((c) => String(c.payload.text ?? '').includes('Bot baru saja menyala'))).toBe(false); // nothing is unresolved any more
   }, 60_000);
+
+  describe('the owner\'s ceilings reach the running bot (round-3 review: wiring)', () => {
+    const ONE_ETH = (10n ** 18n).toString();
+
+    it('a creation fee above the built-in ceiling is refused in Review, and launches once MAX_CREATION_FEE_8453 allows it', async () => {
+      stack = await boot({ configureO1: (o1) => (o1.feeRaw = ONE_ETH), prepare: (rpc) => (rpc.balance = 10n * 10n ** 18n) });
+      await stack.fillAndReview();
+      expect(stack.tg.panelText()).toContain('melebihi batas keamanan bot');
+      expect(stack.tg.panelText()).toContain('MAX_CREATION_FEE_8453');
+      expect(stack.rpc.received).toHaveLength(0);
+      await stack.stop();
+      stack = undefined;
+
+      stack = await boot({ env: { MAX_CREATION_FEE_8453: '2' }, configureO1: (o1) => (o1.feeRaw = ONE_ETH), prepare: (rpc) => (rpc.balance = 10n * 10n ** 18n) });
+      const { tg, rpc, until } = stack;
+      await stack.fillAndReview();
+      await until(() => tg.panelText().includes('Semua cek lolos'), 'review passes with the raised ceiling');
+      tg.press('go:launch');
+      await until(() => tg.panelText().includes('Launch berhasil'), 'launch with the raised ceiling');
+      expect(rpc.received[0]?.tx.value).toBe(10n ** 18n);
+    }, 120_000);
+  });
+
+  describe('ALLOWED_FEE_TOKENS reaches the running bot (round-4 review: wiring)', () => {
+    const FEE_TOKEN = USDC;
+    const tokenFee = (o1: MockO1) => {
+      o1.feeToken = { address: FEE_TOKEN, symbol: 'USDC', decimals: 6 };
+      o1.feeRaw = '1000000';
+    };
+    const knowsToken = (rpc: MockRpc) => rpc.tokens.set(FEE_TOKEN.toLowerCase(), 6);
+
+    it('a creation fee in a token is refused in Review, naming the setting; with the token listed the refusal is gone', async () => {
+      stack = await boot({ configureO1: tokenFee, prepare: knowsToken });
+      await stack.fillAndReview();
+      expect(stack.tg.panelText()).toContain(`ALLOWED_FEE_TOKENS=${FEE_TOKEN}`);
+      await stack.stop();
+      stack = undefined;
+
+      stack = await boot({ env: { ALLOWED_FEE_TOKENS: FEE_TOKEN }, configureO1: tokenFee, prepare: knowsToken });
+      await stack.fillAndReview();
+      expect(stack.tg.panelText()).not.toContain('ALLOWED_FEE_TOKENS');
+      expect(stack.tg.panelText()).not.toContain('meminta creation fee dalam token');
+      expect(stack.rpc.received).toHaveLength(0); // Review never sends anything
+    }, 120_000);
+
+    it('a listed fee token goes through the launcher itself: approve exactly the fee, then launch (the launcher gets the list too)', async () => {
+      stack = await boot({
+        env: { ALLOWED_FEE_TOKENS: FEE_TOKEN },
+        configureO1: tokenFee,
+        prepare: (rpc) => {
+          knowsToken(rpc);
+          rpc.erc20Balance = 10_000_000n;
+        },
+      });
+      const { tg, rpc, until } = stack;
+      await stack.fillAndReview();
+      await until(() => tg.panelText().includes('Semua cek lolos'), 'review passes with the listed fee token');
+      tg.press('go:launch');
+      await until(() => tg.panelText().includes('Launch berhasil'), 'launch with a fee paid in a listed token');
+      expect(rpc.received).toHaveLength(2);
+      expect(String(rpc.received[0]?.tx.to).toLowerCase()).toBe(FEE_TOKEN.toLowerCase()); // the approval of the fee ...
+      expect(String(rpc.received[1]?.tx.to).toLowerCase()).toBe(FACTORY.toLowerCase()); // ... then the launch
+      expect(rpc.received[1]?.tx.value ?? 0n).toBe(0n); // nothing native goes along: the fee was paid in the token
+    }, 120_000);
+  });
 
   it('refuses to start, saying why, when the launch log cannot be written', async () => {
     const notADirectory = join(tempDir(), 'data');

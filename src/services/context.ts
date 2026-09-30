@@ -35,13 +35,19 @@ export interface ResolveOptions {
    * decimals field that lies would make a whole balance look like a rounding error in the review.
    */
   tokenDecimals?: (token: Address) => Promise<number>;
+  /**
+   * Tokens the owner allows as a creation fee (ALLOWED_FEE_TOKENS). o1 charges its fee in the chain's native
+   * currency; a fee in some token is something new and is refused unless the owner vouched for that token,
+   * because the token is named by the API and could be anything the wallet happens to hold.
+   */
+  allowedFeeTokens?: ReadonlySet<string>;
 }
 
 /** The API reports the fee currency as an address; anything else (or the zero address) means native. */
 async function toFee(
   raw: ConfigurationCreationFee | undefined,
   native: { symbol: string; decimals: number },
-  tokenDecimals: ResolveOptions['tokenDecimals'],
+  opts: ResolveOptions,
 ): Promise<LaunchFee | null> {
   if (!raw) return null;
   if (!/^\d+$/.test(String(raw.amount_raw))) throw new UserFacingError('API o1 memberi creation fee yang bukan angka.');
@@ -59,7 +65,14 @@ async function toFee(
     return { amountRaw: amount, currency: zeroAddress, symbol: native.symbol, decimals: native.decimals, isNative: true };
   }
   const currency = raw.currency as Address;
-  const decimals = tokenDecimals ? await tokenDecimals(currency) : raw.decimals;
+  if (!opts.allowedFeeTokens?.has(currency.toLowerCase())) {
+    throw new UserFacingError(
+      `O1 meminta creation fee dalam token ${currency} (${String(raw.symbol ?? '?').slice(0, 12)}), bukan mata uang native chain. ` +
+        'Sampai sekarang o1 hanya memungut fee native, dan nama token itu berasal dari API: bot menolaknya kecuali kamu mengizinkannya. ' +
+        `Kalau kamu sudah memverifikasi token itu, isi ALLOWED_FEE_TOKENS=${currency} di .env.`,
+    );
+  }
+  const decimals = opts.tokenDecimals ? await opts.tokenDecimals(currency) : raw.decimals;
   if (decimals !== raw.decimals) {
     throw new UserFacingError(
       `Desimal token creation fee menurut API o1 (${raw.decimals}) tidak cocok dengan kontrak token ${currency} (${decimals}). Dibatalkan demi keamanan.`,
@@ -90,6 +103,12 @@ export async function resolveLaunchContext(catalog: Catalog, draft: Draft, opts:
   if (draft.quote.decimals !== quote.decimals) {
     throw new UserFacingError(`Desimal pair ${draft.quote.symbol} berubah sejak dipilih (${draft.quote.decimals} → ${quote.decimals}). Pilih ulang pair-nya.`);
   }
+  if (isNativeQuote(quote) && quote.decimals > nativeDecimals) {
+    // More decimals than the chain's own currency would inflate the dev buy: "0.01" would become more than 0.01.
+    throw new UserFacingError(
+      `Desimal pair native ${draft.quote.symbol} menurut API o1 (${quote.decimals}) lebih besar dari mata uang native chain (${nativeDecimals}); jumlah dev buy akan membengkak. Dibatalkan demi keamanan.`,
+    );
+  }
   if (!isNativeQuote(quote) && opts.tokenDecimals) {
     const onChain = await opts.tokenDecimals(quote.address);
     if (onChain !== quote.decimals) {
@@ -103,7 +122,7 @@ export async function resolveLaunchContext(catalog: Catalog, draft: Draft, opts:
     entry,
     suite,
     quote,
-    fee: await toFee(quote.creation_fee ?? suite.creation_fee, { symbol: nativeSymbol, decimals: nativeDecimals }, opts.tokenDecimals),
+    fee: await toFee(quote.creation_fee ?? suite.creation_fee, { symbol: nativeSymbol, decimals: nativeDecimals }, opts),
     nativeSymbol,
     nativeDecimals,
   };

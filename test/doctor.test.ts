@@ -10,7 +10,7 @@ function makeDeps(overrides: Partial<DoctorDeps> = {}) {
   const tokenIndexed = vi.fn(async () => false);
   const getConfig = vi.fn(async (_chain: number, opts: { product: 'tax' | 'non-tax' }) => configFor(opts.product));
   const deps: DoctorDeps = {
-    config: { allowedUserIds: new Set([1, 2]), dataDir: '/srv/o1bot/data', extraAllowedTargets: [], maxCreationFeeWei: {} },
+    config: { allowedUserIds: new Set([1, 2]), dataDir: '/srv/o1bot/data', extraAllowedTargets: [], maxCreationFeeWei: {}, allowedFeeTokens: [] },
     history: { assertWritable: async () => {}, pending: async () => [] },
     telegramGetMe: async () => ({ username: 'my_bot' }),
     wallet: {
@@ -77,7 +77,7 @@ describe('runDoctor', () => {
     const vouched = await runDoctor(
       makeDeps({
         api: { ping: async () => {}, tokenIndexed: async () => false, getConfig } as unknown as DoctorDeps['api'],
-        config: { allowedUserIds: new Set([1]), dataDir: '/d', extraAllowedTargets: [odd], maxCreationFeeWei: {} },
+        config: { allowedUserIds: new Set([1]), dataDir: '/d', extraAllowedTargets: [odd], maxCreationFeeWei: {}, allowedFeeTokens: [] },
       }).deps,
     );
     expect(text(vouched.lines)).not.toContain('bukan Permit2 kanonis');
@@ -97,6 +97,34 @@ describe('runDoctor', () => {
     expect(out).toContain('creation fee 1 ETH'); // not "0.000001" because the API claimed 24 decimals
     expect(out).toContain('creation fee melebihi batas keamanan bot');
     expect(out).toContain('MAX_CREATION_FEE_8453');
+  });
+
+  it('warns about an ERC-20 creation fee that the owner has not allowed, and about native decimals that differ from the chain', async () => {
+    const tokenFee = () => {
+      const cfg = configFor('tax');
+      cfg.suites![0]!.creation_fee = { amount_raw: '5000000', currency: '0x0000000000000000000000000000000000005555', symbol: 'USDC', decimals: 6 };
+      return cfg;
+    };
+    const apiWith = (cfg: () => ReturnType<typeof configFor>) =>
+      ({ ping: async () => {}, tokenIndexed: async () => false, getConfig: vi.fn(async () => cfg()) }) as unknown as DoctorDeps['api'];
+    const refused = await runDoctor(makeDeps({ api: apiWith(tokenFee) }).deps);
+    expect(text(refused.lines)).toContain('o1 meminta creation fee dalam token 0x0000000000000000000000000000000000005555');
+    expect(text(refused.lines)).toContain('ALLOWED_FEE_TOKENS');
+    const allowed = await runDoctor(
+      makeDeps({
+        api: apiWith(tokenFee),
+        config: { allowedUserIds: new Set([1]), dataDir: '/d', extraAllowedTargets: [], maxCreationFeeWei: {}, allowedFeeTokens: ['0x0000000000000000000000000000000000005555'] },
+      }).deps,
+    );
+    expect(text(allowed.lines)).not.toContain('o1 meminta creation fee dalam token');
+
+    const sixDecimals = () => {
+      const cfg = configFor('tax');
+      cfg.suites![0]!.creation_fee = { amount_raw: '1000000000000000', currency: '0x0000000000000000000000000000000000000000', symbol: 'ETH', decimals: 6 };
+      return cfg;
+    };
+    const mismatch = await runDoctor(makeDeps({ api: apiWith(sixDecimals) }).deps);
+    expect(text(mismatch.lines)).toContain('menyebut creation fee native dengan 6 desimal, bot mengharapkan 18');
   });
 
   it('fails on a rejected Telegram token', async () => {

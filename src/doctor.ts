@@ -15,7 +15,7 @@ import type { ChainCheck } from './wallet/wallet.js';
 const PROBE_ADDRESS = '0x000000000000000000000000000000000000dEaD' as const;
 
 export interface DoctorDeps {
-  config: Pick<AppConfig, 'allowedUserIds' | 'dataDir' | 'extraAllowedTargets' | 'maxCreationFeeWei'>;
+  config: Pick<AppConfig, 'allowedUserIds' | 'dataDir' | 'extraAllowedTargets' | 'maxCreationFeeWei' | 'allowedFeeTokens'>;
   /** The launch log: it must be writable (no transaction is sent without a durable record) and may hold unresolved launches. */
   history: {
     assertWritable(): Promise<void>;
@@ -155,6 +155,12 @@ export async function runDoctor(deps: DoctorDeps): Promise<DoctorReport> {
           if (quotes.length === 0) warn(`${label}: belum tersedia untuk launch baru`);
           else pass(`${label}: siap — ${quotes.length} pair${fee ? `, creation fee ${formatAmount(BigInt(fee.amount_raw), feeDecimals ?? 18)} ${fee.symbol}` : ''}`);
 
+          if (fee && nativeFee && feeDecimals !== undefined && fee.decimals !== feeDecimals) {
+            warn(`${label}: API o1 menyebut creation fee native dengan ${fee.decimals} desimal, bot mengharapkan ${feeDecimals}; launch di chain ini akan ditolak. Lapor ke pengembang bot.`);
+          }
+          if (fee && !nativeFee && !deps.config.allowedFeeTokens.includes(fee.currency.toLowerCase())) {
+            warn(`${label}: o1 meminta creation fee dalam token ${fee.currency}; bot menolaknya kecuali kamu mengizinkannya lewat ALLOWED_FEE_TOKENS setelah memverifikasi token itu.`);
+          }
           if (fee && nativeFee && BigInt(fee.amount_raw) > creationFeeCap(chainId, (id) => deps.config.maxCreationFeeWei[id])) {
             warn(`${label}: creation fee melebihi batas keamanan bot; launch akan ditolak. Kalau o1 memang menaikkannya, naikkan MAX_CREATION_FEE_${chainId} setelah kamu memverifikasinya.`);
           }

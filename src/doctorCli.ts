@@ -2,10 +2,14 @@ import { Api } from 'grammy';
 import dotenv from 'dotenv';
 import { ConfigError, configSecrets, loadConfig, type AppConfig } from './config.js';
 import { runDoctor } from './doctor.js';
-import { redact } from './logger.js';
+import { makeErrorPrinter, redact } from './logger.js';
 import { O1Client } from './o1/client.js';
 import { History } from './services/history.js';
 import { ViemWallet } from './wallet/wallet.js';
+
+/** Everything printed as a problem goes through the same redaction, once the secrets are known. */
+let knownSecrets: string[] = [];
+const printProblem = makeErrorPrinter(() => knownSecrets);
 
 /** `npm run doctor`: checks the setup (.env, Telegram, RPC, wallet, o1 API) without sending anything. */
 async function main(): Promise<void> {
@@ -15,7 +19,7 @@ async function main(): Promise<void> {
     config = loadConfig();
   } catch (err) {
     if (err instanceof ConfigError) {
-      console.error(`❌ ${err.message}`);
+      printProblem(`❌ ${err.message}`);
       process.exit(1);
     }
     throw err;
@@ -23,6 +27,7 @@ async function main(): Promise<void> {
 
   // Defence in depth: nothing printed may contain a secret, even inside a third-party error message.
   const secrets = configSecrets(config);
+  knownSecrets = secrets;
   const print = (line: string) => console.log(redact(line, secrets));
   print('✅ .env terbaca dan formatnya valid');
 
@@ -39,6 +44,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error(`❌ ${err instanceof Error ? err.message : String(err)}`);
+  printProblem('❌', err);
   process.exit(1);
 });

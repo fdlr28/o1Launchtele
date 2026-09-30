@@ -205,6 +205,46 @@ describe('what the chain says about tokens (round-3 review)', () => {
     expect(await wallet.isTokenLike(8453, '0x00000000000000000000000000000000000000ff')).toBe(false);
   });
 
+  describe('a failed read is "no such function" only when the node says so (round-3 review)', () => {
+    it.each([
+      [3, 'execution reverted'],
+      [-32000, 'execution reverted'],
+      [-32000, 'execution reverted: no such function'],
+      [-32015, 'VM execution error.'],
+      [-32603, 'invalid opcode: INVALID'],
+    ])('%i "%s" means the contract has no such function', async (code, message) => {
+      rpc.callFault = { code, message };
+      expect(await wallet.isTokenLike(8453, FACTORY)).toBe(false);
+    });
+
+    it.each([
+      [-32603, 'internal error'],
+      [-32005, 'rate limit exceeded'],
+      [-32000, 'header not found'],
+      [-32000, 'context deadline exceeded'],
+      [-32002, 'resource unavailable'],
+      [-32601, 'the method eth_call does not exist/is not available'],
+    ])('%i "%s" means we cannot tell, so the answer is an error, never "not a token"', async (code, message) => {
+      rpc.callFault = { code, message };
+      await expect(wallet.isTokenLike(8453, FACTORY)).rejects.toThrow();
+      await expect(wallet.isTokenLike(8453, USDC)).rejects.toThrow(); // also for an address that IS a token
+    });
+
+    it('an error that is not one of viem\'s is "cannot tell" too: it is rethrown, never read as "not a token"', async () => {
+      const internals = wallet as unknown as { publicClients: Map<number, { readContract: () => Promise<never> }> };
+      internals.publicClients.set(8453, {
+        readContract: async () => {
+          throw new TypeError('something broke inside the client');
+        },
+      });
+      await expect(wallet.isTokenLike(8453, FACTORY)).rejects.toThrow('something broke inside the client');
+    });
+
+    it('a node that answers with nothing is "no such function"', async () => {
+      expect(await wallet.isTokenLike(8453, FACTORY)).toBe(false); // the mock answers 0x for a non-token
+    });
+  });
+
   it('cannot tell when the RPC itself is unreachable, and says so instead of answering "no"', async () => {
     await rpc.stop();
     await expect(wallet.isTokenLike(8453, FACTORY)).rejects.toThrow();

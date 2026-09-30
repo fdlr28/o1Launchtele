@@ -66,6 +66,7 @@ function makeLauncher(extra: Partial<ConstructorParameters<typeof Launcher>[0]> 
     log: silentLogger,
     sleep: clock.sleep,
     now: clock.now,
+    allowedFeeTokens: [USDC], // the owner's ALLOWED_FEE_TOKENS for the tests that pay the fee in USDC
     ...extra,
   });
 }
@@ -1459,5 +1460,66 @@ describe('launch plans that touch the pair (round-3 review: test gap)', () => {
     plansWith(() => [txStep('approve-pair', approve(USDC, FACTORY, 1n)), createStep(FEE_RAW, { depends_on: ['approve-pair'] })]);
     await expect(run(job(usdcDraft))).rejects.toThrow(/token milik rencana/);
     expect(wallet.signedTxs).toHaveLength(0);
+  });
+});
+
+describe('the last gaps of the third review', () => {
+  it('a native pair claiming MORE decimals than the chain\'s own currency would inflate the dev buy, and is refused', async () => {
+    const cfg = configFor('tax');
+    cfg.quotes![0]!.decimals = 19; // the native ETH pair, "19 decimals"
+    api.configs.tax = cfg;
+    const d = withDevBuy('100000000000000000', {}, draftWith());
+    d.quote = { ...d.quote!, decimals: 19 };
+    await expect(run(job(d))).rejects.toThrow(/lebih besar dari mata uang native chain \(18\)/);
+    expect(wallet.signedTxs).toHaveLength(0);
+  });
+
+  it('a native pair with FEWER decimals (Arc\'s 6-decimal USDC interface) is not blocked', async () => {
+    const cfg = configFor('tax');
+    cfg.quotes![0]!.decimals = 6;
+    api.configs.tax = cfg;
+    const d = draftWith();
+    d.quote = { ...d.quote!, decimals: 6 };
+    await expect(run(job(d))).resolves.toBeDefined();
+  });
+
+  it('the native currency is defined by the chain table: an API that lies about its symbol and decimals changes nothing', async () => {
+    const cfg = configFor('tax');
+    cfg.chain = { chain_id: 8453, name: 'Base', native_currency: { symbol: 'FAKE', decimals: 6 } };
+    api.configs.tax = cfg;
+    await expect(run()).resolves.toBeDefined(); // the fee is 18 decimals, as the chain table says
+  });
+
+  describe('a creation fee in a token is refused unless the owner allowed that token (round-3 review, MEDIUM)', () => {
+    it('by default: o1 charges native fees, so a fee in some token named by the API is not paid', async () => {
+      api.configs.tax = withFeeCurrency(USDC, '5');
+      launcher = makeLauncher({ allowedFeeTokens: [] });
+      const err = await run(job(draftWith(), USDC_FEE)).catch((e) => e);
+      expect(err).toBeInstanceOf(UserFacingError);
+      expect(err.message).toContain('bukan mata uang native chain');
+      expect(err.message).toContain(`ALLOWED_FEE_TOKENS=${USDC}`);
+      expect(api.prepareCalls).toHaveLength(0);
+    });
+
+    it('any token the wallet happens to hold cannot be made the "fee currency", whatever the API labels it', async () => {
+      const held = addr(0xda1);
+      const cfg = configFor('tax');
+      cfg.suites![0]!.creation_fee = { amount_raw: (5n * 10n ** 18n).toString(), currency: held, symbol: 'USDC', decimals: 18 };
+      api.configs.tax = cfg;
+      launcher = makeLauncher({ allowedFeeTokens: [] });
+      plansWith(() => [txStep('approve-fee', approve(held, FACTORY, 5n * 10n ** 18n)), createStep('0', { depends_on: ['approve-fee'] })]);
+      await expect(run(job(draftWith(), { currency: held, amountRaw: 5n * 10n ** 18n }))).rejects.toThrow(/O1 meminta creation fee dalam token/);
+      expect(wallet.signedTxs).toHaveLength(0);
+    });
+
+    it('an allowed token is accepted, matched case-insensitively', async () => {
+      const token = addr(0xda1);
+      const cfg = configFor('tax');
+      cfg.suites![0]!.creation_fee = { amount_raw: '5', currency: token, symbol: 'DAI', decimals: 18 };
+      api.configs.tax = cfg;
+      plansWith(() => [txStep('approve-fee', approve(token, FACTORY, 5n)), createStep('0', { depends_on: ['approve-fee'] })]);
+      launcher = makeLauncher({ allowedFeeTokens: [token.toUpperCase().replace('0X', '0x')] });
+      await expect(run(job(draftWith(), { currency: token, amountRaw: 5n }))).resolves.toBeDefined();
+    });
   });
 });
