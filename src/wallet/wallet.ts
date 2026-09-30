@@ -1,6 +1,8 @@
 import {
   BaseError,
+  HttpRequestError,
   RpcError,
+  TimeoutError,
   TransactionNotFoundError,
   TransactionReceiptNotFoundError,
   createPublicClient,
@@ -77,6 +79,13 @@ export interface Wallet {
   /** How many transactions of this wallet are waiting in the mempool (pending nonce minus confirmed nonce). */
   pendingTransactionCount(chainId: number): Promise<number>;
   hasCode(chainId: number, address: Address): Promise<boolean>;
+  /** The token's own `decimals()`, read on chain: the API's number is not trusted. Throws when the RPC cannot say. */
+  erc20Decimals(chainId: number, token: Address): Promise<number>;
+  /**
+   * True when the address answers like an ERC-20 (both decimals() and balanceOf(wallet)). A contract that simply
+   * does not implement them is false. Throws only when the RPC itself cannot be reached.
+   */
+  isTokenLike(chainId: number, address: Address): Promise<boolean>;
   /** Unix seconds of a block (latest when omitted). */
   blockTimestamp(chainId: number, blockNumber?: bigint): Promise<number>;
   signTypedData(chainId: number, payload: TypedDataPayload): Promise<Hex>;
@@ -85,6 +94,8 @@ export interface Wallet {
 export interface ChainRuntime {
   chainId: number;
   rpcUrl: string;
+  /** Overrides the built-in cap on what one transaction may cost in gas (wei). */
+  maxGasCostWei?: bigint;
 }
 
 export interface ChainCheck {
@@ -129,6 +140,16 @@ const DEFINITE_REJECTION = new RegExp(
 const firstLine = (text: string | undefined): string => (text ?? '').split('\n')[0] ?? '';
 
 /**
+ * The RPC could not be reached at all (network, timeout), as opposed to a node that answered. A JSON-RPC error
+ * for a call is NOT treated as a transport failure: nodes report "this contract has no such function" with many
+ * different codes, and the token probe is only one layer of several.
+ */
+function isTransportFailure(err: unknown): boolean {
+  if (!(err instanceof BaseError)) return true;
+  return !!err.walk((e) => e instanceof HttpRequestError || e instanceof TimeoutError);
+}
+
+/**
  * The node's own words for an error. viem hides them behind a generic short message ("Missing or invalid
  * parameters") and keeps the node's text in `details`. The full `message` is not used: it carries the RPC URL.
  */
@@ -163,6 +184,8 @@ export class ViemWallet implements Wallet {
   private readonly broadcastClients = new Map<number, PublicClient>();
   private readonly walletClients = new Map<number, WalletClient>();
   private readonly ready = new Set<number>();
+  private readonly gasCaps = new Map<number, bigint>();
+  private readonly decimalsCache = new Map<string, number>();
 
   constructor(
     privateKey: Hex,
@@ -184,6 +207,7 @@ export class ViemWallet implements Wallet {
         rpcUrls: { default: { http: [runtime.rpcUrl] } },
       });
       const transport = http(runtime.rpcUrl, { timeout: 20_000, retryCount: 2, retryDelay: 400 });
+      if (runtime.maxGasCostWei !== undefined) this.gasCaps.set(runtime.chainId, runtime.maxGasCostWei);
       this.chains.set(runtime.chainId, chain);
       this.publicClients.set(runtime.chainId, createPublicClient({ chain, transport }));
       this.broadcastClients.set(runtime.chainId, createPublicClient({ chain, transport: http(runtime.rpcUrl, { timeout: 20_000, retryCount: 0 }) }));
@@ -242,7 +266,7 @@ export class ViemWallet implements Wallet {
 
     // A broken or hostile RPC could quote an absurd fee and have the wallet burn its balance on gas.
     const info = CHAINS[chainId];
-    const cap = info?.maxGasCostWei ?? DEFAULT_MAX_GAS_COST_WEI;
+    const cap = this.gasCaps.get(chainId) ?? info?.maxGasCostWei ?? DEFAULT_MAX_GAS_COST_WEI;
     const perGas = request.maxFeePerGas ?? request.gasPrice ?? 0n;
     const worstCase = gas * perGas;
     if (worstCase > cap) {
@@ -297,6 +321,31 @@ export class ViemWallet implements Wallet {
       pub.getTransactionCount({ address: this.address, blockTag: 'pending' }),
     ]);
     return Math.max(0, pending - confirmed);
+  }
+
+  async erc20Decimals(chainId: number, token: Address): Promise<number> {
+    const key = `${chainId}:${token.toLowerCase()}`;
+    const known = this.decimalsCache.get(key);
+    if (known !== undefined) return known;
+    const decimals = await this.pub(chainId).readContract({ address: token, abi: erc20Abi, functionName: 'decimals' });
+    this.decimalsCache.set(key, decimals);
+    return decimals;
+  }
+
+  async isTokenLike(chainId: number, address: Address): Promise<boolean> {
+    const pub = this.pub(chainId);
+    const answers = async (read: () => Promise<unknown>): Promise<boolean> => {
+      try {
+        await read();
+        return true;
+      } catch (err) {
+        if (isTransportFailure(err)) throw err; // cannot tell: the caller must not assume "no"
+        return false; // reverted, answered with nothing, or with something that is not a number: not implemented
+      }
+    };
+    const decimals = await answers(() => pub.readContract({ address, abi: erc20Abi, functionName: 'decimals' }));
+    if (!decimals) return false;
+    return answers(() => pub.readContract({ address, abi: erc20Abi, functionName: 'balanceOf', args: [this.address] }));
   }
 
   async hasCode(chainId: number, address: Address): Promise<boolean> {

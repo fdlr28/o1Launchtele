@@ -16,6 +16,8 @@ export class MockRpc {
   estimateError: { code: number; message: string } | null = null;
   balance = 10n ** 18n;
   erc20Balance = 123n;
+  /** ERC-20 contracts (lower-cased address -> decimals). Any other address answers eth_call with empty data, like a contract without those functions. */
+  tokens = new Map<string, number>();
   codeAddresses = new Set<string>();
   received: DecodedTx[] = [];
   estimateParams: unknown[] = [];
@@ -95,6 +97,14 @@ export class MockRpc {
     this.url = `http://127.0.0.1:${(this.server.address() as AddressInfo).port}`;
   }
 
+  /** Makes a transaction the node never received show up as mined (what a bot that was down at the time finds later). */
+  addMinedTransaction(hash: Hex, from = '0x0000000000000000000000000000000000000001'): void {
+    this.received.push({ hash, raw: '0x', tx: { nonce: 0, to: '0x0000000000000000000000000000000000002000', data: '0x', chainId: this.chainId } as never, from });
+    this.receipts.set(hash, { blockNumber: this.block + 1, status: '0x1' });
+    this.mined.add(hash);
+    this.block++;
+  }
+
   /** Includes every pending transaction in a block. */
   mine(): void {
     for (const item of this.received) this.mined.add(item.hash);
@@ -163,8 +173,15 @@ export class MockRpc {
         return toHex(this.balance);
       case 'eth_getCode':
         return this.codeAddresses.has((params[0] as string).toLowerCase()) ? '0x6080' : '0x';
-      case 'eth_call':
-        return toHex(this.erc20Balance, { size: 32 });
+      case 'eth_call': {
+        const call = params[0] as { to?: string; data?: string; input?: string };
+        const decimals = this.tokens.get((call.to ?? '').toLowerCase());
+        if (decimals === undefined) return '0x';
+        const data = (call.data ?? call.input ?? '0x').toLowerCase();
+        if (data.startsWith('0x313ce567')) return toHex(decimals, { size: 32 }); // decimals()
+        if (data.startsWith('0x70a08231')) return toHex(this.erc20Balance, { size: 32 }); // balanceOf(address)
+        return '0x';
+      }
       case 'eth_sendRawTransaction': {
         const raw = params[0] as Hex;
         const tx = parseTransaction(raw);

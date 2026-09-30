@@ -212,6 +212,7 @@ export function reviewText(draft: Draft, review: Review, chainName: string, wall
   lines.push('', '💰 <b>Biaya &amp; dana</b>');
   if (ctx?.fee) {
     lines.push(`  Creation fee: ${esc(formatAmount(ctx.fee.amountRaw, ctx.fee.decimals))} ${esc(ctx.fee.symbol)}`);
+    if (!ctx.fee.isNative) lines.push(`  Token fee: ${code(ctx.fee.currency)}`);
   } else if (ctx) {
     lines.push('  Creation fee: tidak ada');
   }
@@ -224,6 +225,10 @@ export function reviewText(draft: Draft, review: Review, chainName: string, wall
     lines.push(`  Saldo ${esc(fund.symbol)}: ${esc(formatAmount(fund.balanceRaw, fund.decimals))} (${esc(need)})`);
   }
   lines.push(`  Wallet: ${code(shortAddress(wallet))}`);
+
+  if (draft.quote && ctx && draft.quote.address.toLowerCase() !== '0x0000000000000000000000000000000000000000') {
+    lines.push(`  Token pair ${esc(draft.quote.symbol)}: ${code(draft.quote.address)} (${draft.quote.decimals} desimal, sudah dicocokkan dengan kontraknya)`);
+  }
 
   if (review.contracts) {
     const c = review.contracts;

@@ -179,7 +179,15 @@ export class Ui {
         };
       }
       case 'review': {
-        const review = await buildReview({ catalog: this.deps.catalog, wallet: this.deps.wallet, launcher: this.deps.launcher }, draft);
+        const review = await buildReview(
+          {
+            catalog: this.deps.catalog,
+            wallet: this.deps.wallet,
+            launcher: this.deps.launcher,
+            maxCreationFeeWei: (chainId) => this.deps.config.maxCreationFeeWei[chainId],
+          },
+          draft,
+        );
         // Only a passing review can be confirmed, and only for exactly this draft.
         state.reviewed =
           review.ok && review.reviewedFee && review.contracts

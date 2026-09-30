@@ -526,9 +526,10 @@ describe('launches whose outcome is unknown block the next one', () => {
     await expect(run()).rejects.toBeInstanceOf(PendingLaunchError);
   });
 
-  it('treats a transaction the chain has never heard of for 30 minutes as dropped', async () => {
-    seedHistory([{ status: 'unknown', txHash: hash(0xa1) }]);
+  it('treats a transaction the chain has never heard of for 30 minutes as dropped, when the token it would have created does not exist', async () => {
+    seedHistory([{ status: 'unknown', txHash: hash(0xa1), token: TOKEN }]);
     wallet.statuses.set(hash(0xa1), 'unknown');
+    wallet.codeAt.set(TOKEN.toLowerCase(), false);
     clock.ms = START_MS + 31 * 60_000;
     await expect(run()).resolves.toBeDefined();
     expect((await new History(dir).recent('launch', 10)).find((e) => e.txHash === hash(0xa1))).toMatchObject({ status: 'failed' });
@@ -1075,8 +1076,9 @@ describe('the wallet must be idle (round-2 review)', () => {
   });
 
   it('gives up on a transaction nobody has heard of for 30 minutes only when nothing of the wallet is in the mempool', async () => {
-    seedHistory([{ status: 'unknown', txHash: hash(0xa1) }]);
+    seedHistory([{ status: 'unknown', txHash: hash(0xa1), token: TOKEN }]);
     wallet.statuses.set(hash(0xa1), 'unknown');
+    wallet.codeAt.set(TOKEN.toLowerCase(), false);
     clock.ms = START_MS + 31 * 60_000;
 
     wallet.pendingCount = 1; // a node counts a transaction of ours that it will not show by hash
@@ -1216,5 +1218,246 @@ describe('gaps the mutation run of the round-2 review exposed', () => {
     wallet.receipts = ['success', 'reverted'];
     const reverted = await run(job(withDevBuy('1000')));
     expect(reverted.devBuy).toMatchObject({ status: 'failed', unknown: false });
+  });
+});
+
+describe('a call target that is a token is refused (round-3 review, HIGH)', () => {
+  const ATTACKER = addr(0xbad);
+  const transferTo = (to: Address, amount = 10n ** 18n) => encodeFunctionData({ abi: erc20Abi, functionName: 'transfer', args: [to, amount] });
+
+  it('a "factory" that /config made into a token the wallet holds is not called, even with a harmless-looking calldata', async () => {
+    const DAI = addr(0xda1);
+    wallet.tokenLike.add(DAI);
+    const cfg = configFor('tax');
+    cfg.suites![0]!.contracts.factory = DAI;
+    api.configs.tax = cfg;
+    plansWith(() => [txStep('create-launch', { to: DAI, data: '0x12345678', value: FEE_RAW })]);
+    const hostileJob: LaunchJob = { draft: draftWith(), reviewedFee: NATIVE_FEE, reviewedContracts: contractsOf(cfg.suites![0]!) };
+    await expect(run(hostileJob)).rejects.toThrow(/menjawab seperti kontrak token/);
+    expect(wallet.signedTxs).toHaveLength(0);
+  });
+
+  it('... and the actual theft, transfer(attacker, balance) to that "factory", is refused by its selector alone', async () => {
+    const DAI = addr(0xda1);
+    const cfg = configFor('tax');
+    cfg.suites![0]!.contracts.factory = DAI;
+    api.configs.tax = cfg;
+    plansWith(() => [txStep('create-launch', { to: DAI, data: transferTo(ATTACKER), value: '0' })]);
+    const hostileJob: LaunchJob = { draft: draftWith(), reviewedFee: NATIVE_FEE, reviewedContracts: contractsOf(cfg.suites![0]!) };
+    await expect(run(hostileJob)).rejects.toThrow(/fungsi token \(transfer\)/);
+    expect(wallet.signedTxs).toHaveLength(0);
+  });
+
+  it('the pair and the token that is about to be created can never be the target of the launch call', async () => {
+    const cfg = configFor('tax');
+    cfg.suites![0]!.contracts.factory = USDC; // "the factory is the USDC the owner's pair is paid in"
+    api.configs.tax = cfg;
+    plansWith(() => [txStep('create-launch', { to: USDC, data: '0x12345678', value: '0' })]);
+    const usdcDraft = draftWith({ quote: { address: USDC, symbol: 'USDC', decimals: 6, route: 'standard', assetType: 'stablecoin' } });
+    await expect(run({ draft: usdcDraft, reviewedFee: NATIVE_FEE, reviewedContracts: contractsOf(cfg.suites![0]!) })).rejects.toThrow(/token milik rencana/);
+
+    plansWith(() => [txStep('create-launch', { to: TOKEN, data: '0x12345678', value: '0' })]);
+    const cfg2 = configFor('tax');
+    cfg2.suites![0]!.contracts.factory = TOKEN; // the predicted token address itself
+    api.configs.tax = cfg2;
+    await expect(run({ draft: draftWith(), reviewedFee: NATIVE_FEE, reviewedContracts: contractsOf(cfg2.suites![0]!) })).rejects.toThrow(/token milik rencana/);
+    expect(wallet.signedTxs).toHaveLength(0);
+  });
+
+  it('an owner who vouched for a contract (EXTRA_ALLOWED_TARGETS) is not second-guessed by the probe', async () => {
+    const odd = addr(0x0dd);
+    wallet.tokenLike.add(odd);
+    plansWith(() => [txStep('create-launch', { to: odd, data: '0x12345678', value: FEE_RAW })]);
+    await expect(run()).rejects.toThrow(/ditolak demi keamanan/); // not vouched: not callable at all
+    launcher = makeLauncher({ extraTargets: [odd] });
+    await expect(run()).resolves.toBeDefined();
+  });
+
+  it('the probe also guards the router of a dev buy', async () => {
+    wallet.tokenLike.add(ROUTER);
+    api.swapPrepareImpl = async () => ({ steps: [txStep('swap', { to: ROUTER, data: '0xfeed', value: '1000' })] as never });
+    const outcome = await run(job(withDevBuy('1000')));
+    expect(outcome.devBuy?.status === 'failed' && outcome.devBuy.reason).toMatch(/menjawab seperti kontrak token/);
+    expect(wallet.sent).toHaveLength(1); // only the launch
+  });
+
+  it('an RPC that cannot answer the probe stops the launch before anything is signed (no guessing)', async () => {
+    wallet.tokenLikeError = true;
+    await expect(run()).rejects.toThrow();
+    expect(wallet.signedTxs).toHaveLength(0);
+  });
+});
+
+describe('amounts are read from the chain, not from the API (round-3 review, HIGH)', () => {
+  it('a native creation fee whose decimals differ from the chain is refused: 1 ETH must not read as 0.000001', async () => {
+    const cfg = configFor('tax');
+    cfg.suites![0]!.creation_fee = { amount_raw: '1000000000000000000', currency: ZERO, symbol: 'ETH', decimals: 24 };
+    api.configs.tax = cfg;
+    await expect(run(job(draftWith(), { currency: zeroAddress, amountRaw: 10n ** 18n }))).rejects.toThrow(/Desimal creation fee menurut API o1 \(24\)/);
+    expect(api.prepareCalls).toHaveLength(0);
+  });
+
+  it('an absolute ceiling applies even when everything the API says is consistent', async () => {
+    const cfg = configFor('tax');
+    cfg.suites![0]!.creation_fee = { amount_raw: (10n ** 18n).toString(), currency: ZERO, symbol: 'ETH', decimals: 18 }; // 1 ETH on Base
+    api.configs.tax = cfg;
+    const pricey: ReviewedFee = { currency: zeroAddress, amountRaw: 10n ** 18n };
+    await expect(run(job(draftWith(), pricey))).rejects.toThrow(/melebihi batas keamanan bot \(0\.01 ETH\).*MAX_CREATION_FEE_8453/);
+    expect(api.prepareCalls).toHaveLength(0);
+
+    // the owner can raise it on purpose
+    launcher = makeLauncher({ maxCreationFeeWei: (chainId) => (chainId === 8453 ? 2n * 10n ** 18n : undefined) });
+    plansWith(() => [createStep((10n ** 18n).toString())]);
+    await expect(run(job(draftWith(), pricey))).resolves.toBeDefined();
+  });
+
+  it('an ERC-20 fee token whose decimals disagree with the token contract is refused', async () => {
+    api.configs.tax = withFeeCurrency(USDC, '5'); // the config says 6 decimals
+    wallet.tokenDecimals.set(USDC.toLowerCase(), 18); // the chain says 18
+    await expect(run(job(draftWith(), USDC_FEE))).rejects.toThrow(/Desimal token creation fee menurut API o1 \(6\).*\(18\)/);
+    expect(wallet.signedTxs).toHaveLength(0);
+  });
+
+  it('an ERC-20 pair whose decimals disagree with the token contract is refused, so "5" cannot become 5 x 10^18 units', async () => {
+    wallet.tokenDecimals.set(USDC.toLowerCase(), 18);
+    const usdcDraft = withDevBuy('5000000', {}, draftWith({ quote: { address: USDC, symbol: 'USDC', decimals: 6, route: 'standard', assetType: 'stablecoin' } }));
+    await expect(run(job(usdcDraft))).rejects.toThrow(/Desimal pair USDC menurut API o1 \(6\).*\(18\)/);
+    expect(wallet.signedTxs).toHaveLength(0);
+  });
+
+  it('a pair whose decimals changed since it was chosen must be chosen again', async () => {
+    const d = draftWith();
+    d.quote = { ...d.quote!, decimals: 6 };
+    await expect(run(job(d))).rejects.toThrow(/berubah sejak dipilih/);
+  });
+});
+
+describe('settling the history (round-3 review)', () => {
+  const settled = () => historyLines().filter((l) => l.txHash === hash(0xa1)).map((l) => l.status);
+
+  it('a launch that the chain never showed but whose token exists ran under another transaction: settled as confirmed, not retried', async () => {
+    const seen: string[] = [];
+    launcher = makeLauncher({ onSettled: (_entry, status) => void seen.push(status) });
+    // the owner sped up the stuck launch from another app: same nonce and calldata, the token IS created
+    seedHistory([{ status: 'unknown', txHash: hash(0xa1), token: TOKEN, draftId: 'speedup', note: 'replaced by 0xdead' as never }]);
+    wallet.statuses.set(hash(0xa1), 'unknown');
+    wallet.codeAt.set(TOKEN.toLowerCase(), true);
+    clock.ms = START_MS + 31 * 60_000;
+
+    await launcher.pendingLaunches();
+    expect(settled()).toEqual(['unknown', 'confirmed']);
+    expect(seen).toEqual(['confirmed']);
+    expect(await launcher.priorLaunch('speedup')).toMatchObject({ status: 'confirmed' }); // the same draft cannot go again
+  });
+
+  it('... and is settled as failed only when the token does not exist either', async () => {
+    seedHistory([{ status: 'unknown', txHash: hash(0xa1), token: TOKEN }]);
+    wallet.statuses.set(hash(0xa1), 'unknown');
+    wallet.codeAt.set(TOKEN.toLowerCase(), false);
+    clock.ms = START_MS + 31 * 60_000;
+    await launcher.pendingLaunches();
+    expect(settled()).toEqual(['unknown', 'failed']);
+  });
+
+  it('stays pending when it cannot tell: no token recorded, or the code check fails', async () => {
+    seedHistory([{ status: 'unknown', txHash: hash(0xa1) }]); // no token address recorded
+    wallet.statuses.set(hash(0xa1), 'unknown');
+    clock.ms = START_MS + 31 * 60_000;
+    expect((await launcher.pendingLaunches()).map((e) => e.txHash)).toEqual([hash(0xa1)]);
+
+    seedHistory([{ status: 'unknown', txHash: hash(0xa1), token: TOKEN }]);
+    wallet.hasCode = async () => {
+      throw new Error('rpc down');
+    };
+    expect((await launcher.pendingLaunches()).map((e) => e.txHash)).toEqual([hash(0xa1)]);
+    wallet.pendingCountError = true; // or the mempool cannot be read
+    wallet.hasCode = async () => false;
+    expect((await launcher.pendingLaunches()).map((e) => e.txHash)).toEqual([hash(0xa1)]);
+  });
+
+  it('callers that arrive while a check is running share it (no queue of minutes-long checks)', async () => {
+    seedHistory([{ status: 'unknown', txHash: hash(0xa1) }]);
+    wallet.statuses.set(hash(0xa1), 'pending');
+    const before = wallet.statusCalls;
+    const slow = wallet.transactionStatus.bind(wallet);
+    wallet.transactionStatus = async (...args) => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return slow(...args);
+    };
+    await Promise.all([launcher.pendingLaunches(), launcher.pendingLaunches(), launcher.pendingLaunches()]);
+    expect(wallet.statusCalls - before).toBe(1);
+    await launcher.pendingLaunches(); // a later call is a new check
+    expect(wallet.statusCalls - before).toBe(2);
+  });
+
+  it('a node that never answers is "cannot tell", after the deadline, not a hung bot', async () => {
+    launcher = makeLauncher({ rpcTimeoutMs: 30 });
+    seedHistory([{ status: 'unknown', txHash: hash(0xa1) }]);
+    wallet.transactionStatus = () => new Promise(() => {}); // never settles
+    const started = Date.now();
+    expect((await launcher.pendingLaunches()).map((e) => e.txHash)).toEqual([hash(0xa1)]);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    await expect(run()).rejects.toBeInstanceOf(PendingLaunchError);
+  });
+
+  it('nothing is announced for a settlement that could not be recorded, and it is announced once when it can', async () => {
+    const seen: string[] = [];
+    let broken = true;
+    class FlakyDisk extends History {
+      override async append(entry: Parameters<History['append']>[0]): Promise<void> {
+        if (broken) throw new Error('ENOSPC: no space left on device');
+        return super.append(entry);
+      }
+    }
+    launcher = makeLauncher({ history: new FlakyDisk(dir), onSettled: (_e, status) => void seen.push(status) });
+    seedHistory([{ status: 'unknown', txHash: hash(0xa1) }]);
+    wallet.statuses.set(hash(0xa1), 'success');
+
+    for (let tick = 0; tick < 3; tick++) expect((await launcher.pendingLaunches()).map((e) => e.txHash)).toEqual([hash(0xa1)]);
+    expect(seen).toEqual([]); // the minute-by-minute watcher would otherwise have said "BERHASIL" three times
+
+    broken = false;
+    expect(await launcher.pendingLaunches()).toEqual([]);
+    expect(seen).toEqual(['confirmed']);
+    expect(await launcher.pendingLaunches()).toEqual([]);
+    expect(seen).toEqual(['confirmed']);
+  });
+
+  it('dismissing is one more job in the same queue, never interleaved with a settlement', async () => {
+    launcher = makeLauncher({});
+    seedHistory([{ status: 'unknown', txHash: hash(0xa1) }]);
+    wallet.statuses.set(hash(0xa1), 'success');
+    const slow = wallet.transactionStatus.bind(wallet);
+    wallet.transactionStatus = async (...args) => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return slow(...args);
+    };
+    await Promise.all([launcher.pendingLaunches(), launcher.dismissPending()]);
+    expect(settled()).toEqual(['unknown', 'confirmed']); // no "failed, dismissed by owner" line for a launch that had confirmed
+  });
+});
+
+describe('the wallet-idle check looks twice (round-3 review)', () => {
+  it('a node that is a block ahead for a moment does not block the next launch', async () => {
+    let calls = 0;
+    wallet.pendingTransactionCount = async () => (++calls === 1 ? 1 : 0);
+    await expect(run()).resolves.toBeDefined();
+    expect(clock.sleeps).toContain(3_000);
+    expect(calls).toBe(2);
+  });
+
+  it('a transaction that is really waiting is still refused after the second look', async () => {
+    wallet.pendingCount = 1;
+    await expect(run()).rejects.toThrow(/1 transaksi yang belum terkonfirmasi/);
+    expect(clock.sleeps).toContain(3_000);
+  });
+});
+
+describe('launch plans that touch the pair (round-3 review: test gap)', () => {
+  it('a launch plan that approves the PAIR token is refused when the fee is native', async () => {
+    const usdcDraft = draftWith({ quote: { address: USDC, symbol: 'USDC', decimals: 6, route: 'standard', assetType: 'stablecoin' } });
+    plansWith(() => [txStep('approve-pair', approve(USDC, FACTORY, 1n)), createStep(FEE_RAW, { depends_on: ['approve-pair'] })]);
+    await expect(run(job(usdcDraft))).rejects.toThrow(/token milik rencana/);
+    expect(wallet.signedTxs).toHaveLength(0);
   });
 });

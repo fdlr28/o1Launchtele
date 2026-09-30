@@ -1,9 +1,12 @@
 import { GrammyError, HttpError } from 'grammy';
+import { isAddress, zeroAddress } from 'viem';
 import { CHAINS, chainName } from './chains.js';
 import type { AppConfig } from './config.js';
 import { formatAmount } from './domain/units.js';
 import { describeError } from './errors.js';
 import { Catalog, usableQuotes } from './o1/catalog.js';
+import { creationFeeCap } from './services/context.js';
+import { CANONICAL_PERMIT2 } from './services/guard.js';
 import { ApiError, type O1Api } from './o1/client.js';
 import type { Product } from './o1/types.js';
 import type { ChainCheck } from './wallet/wallet.js';
@@ -12,7 +15,7 @@ import type { ChainCheck } from './wallet/wallet.js';
 const PROBE_ADDRESS = '0x000000000000000000000000000000000000dEaD' as const;
 
 export interface DoctorDeps {
-  config: Pick<AppConfig, 'allowedUserIds' | 'dataDir'>;
+  config: Pick<AppConfig, 'allowedUserIds' | 'dataDir' | 'extraAllowedTargets' | 'maxCreationFeeWei'>;
   /** The launch log: it must be writable (no transaction is sent without a durable record) and may hold unresolved launches. */
   history: {
     assertWritable(): Promise<void>;
@@ -144,9 +147,24 @@ export async function runDoctor(deps: DoctorDeps): Promise<DoctorReport> {
         try {
           const entry = await catalog.get(chainId, product, { fresh: true });
           const quotes = usableQuotes(entry);
-          const fee = entry.suites.find((s) => s.creation_available)?.creation_fee;
+          const suite = entry.suites.find((s) => s.creation_available);
+          const fee = suite?.creation_fee;
+          const nativeFee = !!fee && (!isAddress(fee.currency) || fee.currency.toLowerCase() === zeroAddress);
+          // A chain's native currency has fixed decimals here; the API's own number is only used for tokens.
+          const feeDecimals = nativeFee ? (CHAINS[chainId]?.nativeDecimals ?? fee.decimals) : fee?.decimals;
           if (quotes.length === 0) warn(`${label}: belum tersedia untuk launch baru`);
-          else pass(`${label}: siap — ${quotes.length} pair${fee ? `, creation fee ${formatAmount(BigInt(fee.amount_raw), fee.decimals)} ${fee.symbol}` : ''}`);
+          else pass(`${label}: siap — ${quotes.length} pair${fee ? `, creation fee ${formatAmount(BigInt(fee.amount_raw), feeDecimals ?? 18)} ${fee.symbol}` : ''}`);
+
+          if (fee && nativeFee && BigInt(fee.amount_raw) > creationFeeCap(chainId, (id) => deps.config.maxCreationFeeWei[id])) {
+            warn(`${label}: creation fee melebihi batas keamanan bot; launch akan ditolak. Kalau o1 memang menaikkannya, naikkan MAX_CREATION_FEE_${chainId} setelah kamu memverifikasinya.`);
+          }
+          const permit2 = suite?.contracts.permit2?.toLowerCase();
+          if (permit2 && permit2 !== CANONICAL_PERMIT2 && !deps.config.extraAllowedTargets.includes(permit2)) {
+            warn(
+              `${label}: Permit2 chain ini (${permit2}) bukan Permit2 kanonis, jadi dev buy dengan pair ERC-20 akan ditolak. ` +
+                'Kalau kamu sudah memverifikasi alamat itu, daftarkan di EXTRA_ALLOWED_TARGETS (dev buy dengan pair native tidak terpengaruh).',
+            );
+          }
         } catch (err) {
           warn(`${label}: konfigurasi tidak bisa dimuat (${short(err)})`);
         }

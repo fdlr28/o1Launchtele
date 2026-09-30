@@ -11,8 +11,8 @@ import { extractTxSteps, extractTypedData, sameAddress, type ExtractedTx } from 
 import type { ContractSuite, LaunchPrepareResult, PlanIssue, SwapQuoteRequest } from '../o1/types.js';
 import type { Logger } from '../logger.js';
 import { BroadcastRejectedError, type Receipt, type TxStatus, type Wallet } from '../wallet/wallet.js';
-import { resolveLaunchContext, type LaunchContext } from './context.js';
-import { assertPlanAllowed, assertTypedDataAllowed, guardPolicyFor, type CheckedTx, type GuardPolicy } from './guard.js';
+import { creationFeeCap, resolveLaunchContext, type LaunchContext } from './context.js';
+import { assertPlanAllowed, assertTypedDataAllowed, guardPolicyFor, withNeverCall, type CheckedTx, type GuardPolicy } from './guard.js';
 import type { History, HistoryEntry } from './history.js';
 
 export type Stage =
@@ -102,6 +102,10 @@ export interface LauncherDeps {
   extraTargets?: readonly string[];
   /** Called when a launch that was pending turns out to have confirmed, reverted or vanished. */
   onSettled?: (entry: HistoryEntry, status: 'confirmed' | 'reverted' | 'failed') => void;
+  /** Most a native creation fee may be on a chain (wei). The API's own number is not trusted. Defaults to the chain table. */
+  maxCreationFeeWei?: (chainId: number) => bigint | undefined;
+  /** Longest one RPC question may take while the history is settled (a hung node must not stall every review). */
+  rpcTimeoutMs?: number;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
 }
@@ -134,6 +138,9 @@ const MAX_PREPARE_ROUNDS = 3;
 const FRESHNESS_MARGIN_MS = 5_000;
 /** Assumed lifetime of a swap plan whose response carries no usable expiry. */
 const SWAP_DEFAULT_TTL_MS = 60_000;
+/** A second look at the wallet's mempool after this long: a load-balanced node can be a block behind for a moment. */
+const IDLE_RECHECK_MS = 3_000;
+const DEFAULT_RPC_TIMEOUT_MS = 15_000;
 const BROADCAST_LOOKUP_ATTEMPTS = 5;
 const BROADCAST_LOOKUP_INTERVAL_MS = 3_000;
 /** A pending launch that the chain has never heard of after this long is treated as dropped. */
@@ -157,10 +164,14 @@ export class Launcher {
   private exclusiveChain: Promise<unknown> = Promise.resolve();
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
+  private readonly rpcTimeoutMs: number;
+  /** The settle run that is in flight: callers that arrive meanwhile share it instead of queueing their own. */
+  private settling: Promise<HistoryEntry[]> | null = null;
 
   constructor(private readonly deps: LauncherDeps) {
     this.sleep = deps.sleep ?? defaultSleep;
     this.now = deps.now ?? Date.now;
+    this.rpcTimeoutMs = deps.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
   }
 
   isBusy(): boolean {
@@ -189,7 +200,23 @@ export class Launcher {
    * clearly vanished are settled in the history on the way.
    */
   pendingLaunches(): Promise<HistoryEntry[]> {
-    return this.exclusive(() => this.settlePending());
+    if (!this.settling) {
+      const run = this.exclusive(() => this.settlePending());
+      this.settling = run.finally(() => {
+        this.settling = null;
+      });
+    }
+    return this.settling;
+  }
+
+  /** An RPC question with a deadline: a node that never answers counts as "cannot tell", not as a stalled bot. */
+  private bounded<T>(work: Promise<T>): Promise<T> {
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error('RPC tidak menjawab tepat waktu')), this.rpcTimeoutMs);
+      timer.unref?.();
+    });
+    return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
   }
 
   private exclusive<T>(job: () => Promise<T>): Promise<T> {
@@ -207,15 +234,16 @@ export class Launcher {
       const txHash = entry.txHash as Hash;
       let status: TxStatus;
       try {
-        status = await this.deps.wallet.transactionStatus(entry.chainId, txHash);
+        status = await this.bounded(this.deps.wallet.transactionStatus(entry.chainId, txHash));
       } catch {
         still.push(entry); // the RPC cannot tell us: stay blocked rather than risk a double launch
         continue;
       }
-      if (status === 'success') await this.settle(entry, 'confirmed', 'settled later');
-      else if (status === 'reverted') await this.settle(entry, 'reverted', 'settled later');
-      else if (status === 'unknown' && (await this.canGiveUp(entry))) await this.settle(entry, 'failed', 'not found on chain after 30 minutes');
-      else still.push(entry);
+      let settled = false;
+      if (status === 'success') settled = await this.settle(entry, 'confirmed', 'settled later');
+      else if (status === 'reverted') settled = await this.settle(entry, 'reverted', 'settled later');
+      else if (status === 'unknown' && (await this.canGiveUp(entry))) settled = await this.giveUp(entry);
+      if (!settled) still.push(entry);
     }
     return still;
   }
@@ -228,19 +256,44 @@ export class Launcher {
   private async canGiveUp(entry: HistoryEntry): Promise<boolean> {
     if (this.now() - Date.parse(entry.ts) <= PENDING_GIVE_UP_MS) return false;
     try {
-      return (await this.deps.wallet.pendingTransactionCount(entry.chainId)) === 0;
+      return (await this.bounded(this.deps.wallet.pendingTransactionCount(entry.chainId))) === 0;
     } catch {
       return false;
     }
   }
 
-  private async settle(entry: HistoryEntry, status: 'confirmed' | 'reverted' | 'failed', note: string): Promise<void> {
-    await this.record(historyBase(entry, status, note));
+  /**
+   * Nothing of the wallet is waiting and the chain never showed this hash. That still does not mean the launch did
+   * not happen: a speed-up made from another client (same nonce, same calldata) executes it under another hash.
+   * The token's address is fixed in advance, so code at that address settles the question.
+   */
+  private async giveUp(entry: HistoryEntry): Promise<boolean> {
+    if (!entry.token) return false; // nothing to check against: the owner has to decide (/dismiss)
+    let exists: boolean;
+    try {
+      exists = await this.bounded(this.deps.wallet.hasCode(entry.chainId, entry.token));
+    } catch {
+      return false;
+    }
+    return exists
+      ? this.settle(entry, 'confirmed', 'the token exists on chain, so the launch ran under another transaction')
+      : this.settle(entry, 'failed', 'not found on chain after 30 minutes');
+  }
+
+  /** Records the settlement, and only then announces it: an announcement for something not recorded would repeat every minute. */
+  private async settle(entry: HistoryEntry, status: 'confirmed' | 'reverted' | 'failed', note: string): Promise<boolean> {
+    try {
+      await this.deps.history.append(historyBase(entry, status, note));
+    } catch (err) {
+      this.deps.log.error('failed to record a settlement; it stays pending', err);
+      return false;
+    }
     try {
       this.deps.onSettled?.({ ...entry, status, note }, status);
     } catch (err) {
       this.deps.log.debug('onSettled callback failed', err);
     }
+    return true;
   }
 
   /** The owner's explicit acknowledgement that the pending launches will never confirm. */
@@ -272,7 +325,12 @@ export class Launcher {
 
   /** A transaction of this wallet that is still waiting for a block would be overtaken by (or collide with) a new one. */
   private async assertWalletIdle(chainId: number): Promise<void> {
-    const waiting = await this.deps.wallet.pendingTransactionCount(chainId);
+    let waiting = await this.deps.wallet.pendingTransactionCount(chainId);
+    if (waiting > 0) {
+      // A load-balanced node can be a block ahead for a moment (our own launch just confirmed): look again once.
+      await this.sleep(IDLE_RECHECK_MS);
+      waiting = await this.deps.wallet.pendingTransactionCount(chainId);
+    }
     if (waiting > 0) {
       throw new UserFacingError(
         `Wallet bot masih punya ${waiting} transaksi yang belum terkonfirmasi di jaringan ini. Tunggu sampai selesai (atau bereskan di explorer), lalu coba lagi.`,
@@ -324,10 +382,11 @@ export class Launcher {
     if (prior) throw new DraftAlreadyLaunchedError(prior);
     await this.assertWalletIdle(chainId);
 
-    const ctx = await resolveLaunchContext(catalog, draft, { fresh: true });
+    const ctx = await resolveLaunchContext(catalog, draft, { fresh: true, tokenDecimals: (token) => wallet.erc20Decimals(chainId, token) });
     if (!sameContracts(contractsOf(ctx.suite), job.reviewedContracts)) {
       throw new UserFacingError('Alamat kontrak o1 berubah sejak Review. Buka Review lagi, periksa alamatnya, lalu konfirmasi ulang.');
     }
+    this.assertFeeWithinCap(ctx, chainId);
     this.assertFeeNotHigher(ctx, job.reviewedFee);
     const feeNative = ctx.fee?.isNative ? ctx.fee.amountRaw : 0n;
     const feeToken = ctx.fee && !ctx.fee.isNative ? ctx.fee : null;
@@ -340,6 +399,7 @@ export class Launcher {
       kind: 'launch',
       // A launch needs no allowance for the pair; the only ERC-20 it may touch is an ERC-20 creation fee.
       erc20: feeToken ? [{ address: feeToken.currency, maxApprove: feeToken.amountRaw, maxPermit: 0n }] : [],
+      neverCall: [ctx.quote.address],
       maxTotalNativeValue: feeNative,
       extraTargets: this.deps.extraTargets,
       nowSec: this.nowSec,
@@ -360,7 +420,13 @@ export class Launcher {
       const steps = extractTxSteps(plan);
       if (steps.length === 0) throw new UserFacingError('API o1 tidak mengembalikan transaksi untuk ditandatangani.');
       // Judge the WHOLE plan before signing anything: a bad step must not be discovered after earlier ones were sent.
-      const checked = assertPlanAllowed(steps.map((s) => ({ id: s.id, transaction: s.transaction })), policy, { finalCall: true });
+      // The token this plan is about to create is one more thing that can only be approved, never called.
+      const checked = assertPlanAllowed(
+        steps.map((s) => ({ id: s.id, transaction: s.transaction })),
+        withNeverCall(policy, [plan.predicted_token_address]),
+        { finalCall: true },
+      );
+      await this.assertNotTokens(chainId, checked);
       if (steps.slice(0, -1).some((s) => s.simulationNotRun)) {
         throw new UserFacingError('Urutan langkah dari API tidak dikenali (prasyarat ditandai belum disimulasikan).');
       }
@@ -410,6 +476,36 @@ export class Launcher {
       }
     }
     return outcome;
+  }
+
+  /** An absolute ceiling on a native creation fee, independent of anything the API says about its own numbers. */
+  private assertFeeWithinCap(ctx: LaunchContext, chainId: number): void {
+    if (!ctx.fee?.isNative) return;
+    const cap = creationFeeCap(chainId, this.deps.maxCreationFeeWei);
+    if (ctx.fee.amountRaw > cap) {
+      throw new UserFacingError(
+        `Creation fee ${formatAmount(ctx.fee.amountRaw, ctx.nativeDecimals)} ${ctx.nativeSymbol} melebihi batas keamanan bot (${formatAmount(cap, ctx.nativeDecimals)} ${ctx.nativeSymbol}). ` +
+          `Kalau o1 memang menaikkan fee, naikkan batasnya dengan MAX_CREATION_FEE_${chainId} di .env setelah kamu memverifikasinya.`,
+      );
+    }
+  }
+
+  /**
+   * A call may only go to the factory or a router, never to a token. The guard already refuses the tokens of the
+   * plan and every token-moving function; this asks the chain as well, because a hostile /config could call any
+   * token the wallet happens to hold (a stablecoin from claimed fees, the tokens of an earlier dev buy).
+   */
+  private async assertNotTokens(chainId: number, checked: CheckedTx[]): Promise<void> {
+    const vouched = new Set((this.deps.extraTargets ?? []).map((a) => a.toLowerCase()));
+    for (const tx of checked) {
+      if (tx.kind !== 'call' || vouched.has(tx.to.toLowerCase())) continue;
+      if (await this.deps.wallet.isTokenLike(chainId, tx.to)) {
+        throw new UserFacingError(
+          `Transaksi ditolak demi keamanan: ${tx.to} menjawab seperti kontrak token (ERC-20), bukan factory atau router. ` +
+            'Kalau ini memang kontrak o1 yang sah, daftarkan alamatnya di EXTRA_ALLOWED_TARGETS setelah kamu memverifikasinya.',
+        );
+      }
+    }
   }
 
   /** The launch aborts if the live fee is higher than, or in another currency than, the one the owner reviewed. */
@@ -578,6 +674,7 @@ export class Launcher {
       kind: 'swap',
       // The pair is the only token a buy pays with; its allowance and permit may cover at most the dev buy.
       erc20: native ? [] : [{ address: ctx.quote.address, maxApprove: amount, maxPermit: amount }],
+      neverCall: [ctx.quote.address, token],
       maxTotalNativeValue: native ? amount : 0n,
       extraTargets: this.deps.extraTargets,
       nowSec: this.nowSec,
@@ -653,6 +750,7 @@ export class Launcher {
           );
         }
         const checked = assertPlanAllowed(swapSteps.map((s) => ({ id: s.id, transaction: s.transaction })), policy, { finalCall: true });
+        await this.assertNotTokens(chainId, checked);
         const deadline = this.swapDeadline(prepared, receivedAt);
 
         let stale = false;

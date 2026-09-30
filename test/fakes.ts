@@ -23,7 +23,7 @@ import {
   type TypedDataPayload,
   type Wallet,
 } from '../src/wallet/wallet.js';
-import { FACTORY, TOKEN, WALLET, configFor } from './fixtures.js';
+import { AAPL, FACTORY, TOKEN, USDC, WALLET, configFor } from './fixtures.js';
 
 export const FEE_RAW = '1000000000000000';
 export const START_MS = Date.parse('2026-01-01T00:00:00Z');
@@ -87,6 +87,16 @@ export class FakeWallet implements Wallet {
   /** Thrown by the next sign() call (e.g. a gas estimate that reverts). */
   signError: Error | null = null;
   codeAfterCalls = 0;
+  /** Addresses whose code is set explicitly (overrides the call counter): e.g. the token of a launch that really happened. */
+  codeAt = new Map<string, boolean>();
+  /** Decimals per token as the chain reports them; everything else is 18. */
+  tokenDecimals = new Map<string, number>([
+    [USDC.toLowerCase(), 6],
+    [AAPL.toLowerCase(), 8],
+  ]);
+  /** Addresses that answer like an ERC-20 (decimals() and balanceOf()). */
+  tokenLike = new Set<string>();
+  tokenLikeError = false;
   private codeCalls = 0;
   launchTimestamp = 1_000;
   latestTimestamp = 1_004;
@@ -143,9 +153,18 @@ export class FakeWallet implements Wallet {
     if (this.pendingCountError) throw new Error('RPC unreachable');
     return this.pendingCount;
   }
-  async hasCode() {
+  async hasCode(_chainId?: number, address?: Address) {
+    const forced = address ? this.codeAt.get(address.toLowerCase()) : undefined;
+    if (forced !== undefined) return forced;
     this.codeCalls++;
     return this.codeCalls > this.codeAfterCalls;
+  }
+  async erc20Decimals(_chainId: number, token: Address): Promise<number> {
+    return this.tokenDecimals.get(token.toLowerCase()) ?? 18;
+  }
+  async isTokenLike(_chainId: number, address: Address): Promise<boolean> {
+    if (this.tokenLikeError) throw new Error('RPC unreachable');
+    return this.tokenLike.has(address.toLowerCase());
   }
   async blockTimestamp(_chainId: number, blockNumber?: bigint) {
     return blockNumber === undefined ? this.latestTimestamp : this.launchTimestamp;

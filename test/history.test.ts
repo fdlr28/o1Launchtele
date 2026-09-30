@@ -131,4 +131,39 @@ describe('History', () => {
     await new History(dir).append(launch({ txHash: hash(10) }));
     expect((await new History(dir).pending()).map((e) => e.txHash)).toEqual([hash(9), hash(10)]);
   });
+
+  describe('the disk can write less than it was asked to, without an error (round-3 review)', () => {
+    /** An `open` whose handles write at most `caps[i]` bytes on the i-th call (then everything). */
+    const stingyOpen = (caps: number[]): typeof open =>
+      (async (path: Parameters<typeof open>[0], flags?: Parameters<typeof open>[1], mode?: Parameters<typeof open>[2]) => {
+        const real = await open(path, flags, mode);
+        return new Proxy(real, {
+          get(target, prop) {
+            if (prop === 'write') {
+              return async (buffer: Buffer, offset: number, length: number, position: number | null) =>
+                real.write(buffer, offset, Math.min(length, caps.shift() ?? length), position);
+            }
+            const value = Reflect.get(target, prop);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+      }) as unknown as typeof open;
+
+    it('keeps writing until the whole record is out, so the write-ahead line is never torn by a short write', async () => {
+      const dir = tempDir();
+      const history = new History(dir, stingyOpen([5, 1, 7, 3]));
+      await history.append(launch({ txHash: hash(1), name: 'A record that needs several writes' }));
+      expect((await new History(dir).pending()).map((e) => e.txHash)).toEqual([hash(1)]);
+      expect(readFileSync(join(dir, 'launches.jsonl'), 'utf8')).toContain('A record that needs several writes');
+    });
+
+    it('a disk that accepts nothing more is an error (and so nothing gets sent), not a silent success', async () => {
+      const dir = tempDir();
+      const history = new History(dir, stingyOpen([4, 0]));
+      await expect(history.append(launch({ txHash: hash(1) }))).rejects.toThrow(/short write/);
+      // the torn start of the record does not hide the next one
+      await new History(dir).append(launch({ txHash: hash(2) }));
+      expect((await new History(dir).pending()).map((e) => e.txHash)).toEqual([hash(2)]);
+    });
+  });
 });

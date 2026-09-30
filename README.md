@@ -180,10 +180,21 @@ Kalau dev buy gagal, launch-nya tetap sukses dan bot memberitahumu.
     maksimal 31 hari dan tanda tangan maksimal 24 jam. Yang ditandatangani adalah pesan yang **disusun ulang bot dari
     field yang sudah divalidasi** (bukan objek dari API), jadi pemeriksa dan penanda tangan tidak bisa berbeda tafsir.
 
+  - **panggilan tidak pernah boleh ditujukan ke token.** Panggilan launch/swap tidak boleh diawali fungsi token
+    (`transfer`, `transferFrom`, `approve`, `setApprovalForAll`, `permit`, …), tidak boleh menuju pair, token fee, atau token
+    yang akan dibuat, dan kontrak tujuannya ditanyakan ke chain: yang menjawab seperti ERC-20 ditolak. Ini menutup jalan
+    "factory palsu = token yang ada di wallet-mu".
+
   Kontrak tujuan (factory, router) diambil dari `/config` o1 untuk chain yang dipilih. **Alamatnya ditampilkan di Review**
   supaya bisa kamu cocokkan dengan alamat resmi o1, dan launch dibatalkan kalau alamat itu berubah sesudah Review.
   Pemeriksaan ini **tidak bisa dimatikan**; kontrak tambahan yang sudah kamu verifikasi sendiri bisa didaftarkan di
-  `EXTRA_ALLOWED_TARGETS` (kosong secara bawaan).
+  `EXTRA_ALLOWED_TARGETS` (kosong secara bawaan). Bot tidak menyimpan "daftar alamat terpercaya" permanen (o1 memperbarui
+  kontraknya dari waktu ke waktu), jadi kalau API o1 sendiri dibobol, dana yang bisa terpapar dibatasi pada fee + dev buy
+  yang kamu setujui di Review, bukan isi wallet.
+- **Angka dibaca dari chain, bukan dari klaim API.** Desimal mata uang native chain datang dari tabel bot, desimal token
+  (pair dan token fee) dibaca dari kontrak tokennya dan harus cocok dengan klaim API; alamat token ditampilkan di Review.
+  Ada juga batas mutlak creation fee per chain (kira-kira 10x fee o1 sekarang) dan batas biaya gas; keduanya bisa dinaikkan
+  dengan `MAX_CREATION_FEE_<chainId>` / `MAX_GAS_COST_<chainId>` setelah kamu memverifikasi bahwa naiknya memang wajar.
 - **Review terikat ke drafnya.** Konfirmasi hanya berlaku untuk draf yang persis sama dengan yang di-review; kalau ada yang
   diubah sesudahnya, kamu diminta Review ulang. Setiap upaya launch (sukses atau gagal) juga butuh Review baru.
 - **Satu draf = satu launch.** Draf yang launch-nya sudah terkirim atau berhasil tidak bisa diluncurkan lagi (akan
@@ -226,6 +237,9 @@ menyala kembali). Yang perlu kamu lakukan:
    (berhasil, revert, atau gugur). Draf itu lalu ditandai selesai dan tidak bisa diluncurkan lagi.
 3. Kalau **tidak akan pernah terkonfirmasi** (hilang dari mempool), kirim `/dismiss ya`. Transaksi yang tidak dikenal chain
    selama 30 menit dianggap gugur otomatis, tetapi hanya kalau wallet bot tidak punya transaksi tertunda di mempool.
+   Sebelum dianggap gugur bot juga memeriksa apakah token yang seharusnya dibuat sudah ada di chain: kalau ya, launch-nya
+   ternyata berjalan lewat transaksi lain (mis. kamu mempercepat transaksi dari aplikasi wallet) dan dicatat sebagai
+   **berhasil**, bukan gugur.
 
 Jangan gunakan `/dismiss ya` kalau transaksinya mungkin masih akan masuk: itu bisa menyebabkan launch dobel.
 
@@ -245,6 +259,9 @@ atau `1.0000` (desimal).
   Permit2 lebih dari 31 hari, atau approve tak terbatas ke router) ditolak, dan dev buy-nya dilaporkan gagal (launch-nya
   tetap sukses). Kalau hasil dev buy tidak jelas (swap terkirim tapi belum terkonfirmasi), bot **tidak** menyuruhmu membeli
   manual sebelum kamu mengecek hash-nya, supaya tidak beli dobel.
+- **Arc:** USDC di Arc punya dua antarmuka (native 18 desimal, ERC-20 6 desimal) dengan satu saldo. Launch dengan pair
+  native USDC dan terutama dev buy di Arc **belum pernah diuji**; kalau bot menolak sesuatu di sana, itu disengaja
+  (gagal dengan aman). Lapor saja, jangan dipaksa.
 - **Tanpa atomic dev buy** (lihat di atas) dan tanpa klaim fee di bot (klaim lewat web o1).
 - Supply tetap 1 miliar token dan likuiditas terkunci permanen; itu aturan kontrak o1, bukan bot.
 
@@ -263,6 +280,10 @@ atau `1.0000` (desimal).
 | `Alamat kontrak o1 berubah sejak Review` | Konfigurasi o1 berubah setelah Review. Buka Review lagi, cocokkan alamatnya, lalu konfirmasi. |
 | `Wallet bot masih punya N transaksi yang belum terkonfirmasi` | Tunggu sampai transaksi itu masuk (atau bereskan di explorer / aplikasi wallet), lalu coba lagi. |
 | `Biaya gas maksimum … melebihi batas keamanan` | RPC atau jaringan memberi harga gas tak wajar; tidak ada yang dikirim. Coba lagi nanti atau ganti RPC. |
+| `Creation fee … melebihi batas keamanan bot` | Fee dari API lebih dari ~10x fee o1 yang diketahui. Periksa pengumuman o1; kalau memang naik, set `MAX_CREATION_FEE_<chainId>` di `.env`. |
+| `Desimal … menurut API o1 … tidak cocok` | Angka desimal dari API berbeda dengan kontrak tokennya (atau mata uang native chain). Jangan dilewati; itu tanda data API yang salah. |
+| `… menjawab seperti kontrak token (ERC-20), bukan factory atau router` | Alamat tujuan dari `/config` ternyata sebuah token. Jangan dilewati; laporkan ke o1. |
+| `Permit2 yang dipakai chain ini … bukan Permit2 kanonis` | Dev buy dengan pair ERC-20 butuh Permit2 kanonis. Kalau kamu sudah memverifikasi alamat Permit2 chain itu, daftarkan di `EXTRA_ALLOWED_TARGETS`. |
 | `Riwayat launch tidak bisa dibaca` / `Folder data … tidak bisa ditulis` | Periksa izin folder `DATA_DIR` (di VPS: `/opt/o1launchtele/data`, milik user `o1bot`). Tanpa catatan riwayat bot menolak mengirim transaksi. |
 | `Draft berubah sejak Review` | Ada yang diubah setelah Review. Buka Review lagi lalu konfirmasi. |
 | `… harus URL https://` | Semua URL harus `https://` (atau `http://localhost`). Perbaiki di `.env`. |

@@ -1,4 +1,4 @@
-import { isAddress, type Hex } from 'viem';
+import { isAddress, parseUnits, type Hex } from 'viem';
 import { CHAINS, SUPPORTED_CHAIN_IDS } from './chains.js';
 import { secretVariants, urlSecrets, type LogLevel } from './logger.js';
 
@@ -18,6 +18,9 @@ export interface AppConfig {
   devBuySlippageBps: number;
   /** Contracts the owner explicitly trusts on top of those o1 publishes in /config (normally empty). */
   extraAllowedTargets: string[];
+  /** The owner's overrides (MAX_GAS_COST_<id>, MAX_CREATION_FEE_<id>, in native units) of the built-in ceilings, in wei. */
+  maxGasCostWei: Record<number, bigint>;
+  maxCreationFeeWei: Record<number, bigint>;
   dataDir: string;
   logLevel: LogLevel;
 }
@@ -115,6 +118,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     errors.push('Tidak ada chain aktif. Isi minimal satu RPC_URL_<chainId>, misalnya RPC_URL_8453.');
   }
 
+  const maxGasCostWei: Record<number, bigint> = {};
+  const maxCreationFeeWei: Record<number, bigint> = {};
+  for (const id of SUPPORTED_CHAIN_IDS) {
+    for (const [name, target] of [['MAX_GAS_COST', maxGasCostWei], ['MAX_CREATION_FEE', maxCreationFeeWei]] as const) {
+      const raw = get(`${name}_${id}`);
+      if (raw === undefined) continue;
+      if (!/^\d+(\.\d{1,18})?$/.test(raw) || parseUnits(raw, 18) <= 0n) errors.push(`${name}_${id} harus angka positif dalam satuan native chain, mis. 0.05.`);
+      else target[id] = parseUnits(raw, 18);
+    }
+  }
+
   const slippageRaw = get('DEV_BUY_SLIPPAGE_BPS');
   let devBuySlippageBps = 500;
   if (slippageRaw !== undefined) {
@@ -154,6 +168,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     chainIds,
     devBuySlippageBps,
     extraAllowedTargets,
+    maxGasCostWei,
+    maxCreationFeeWei,
     dataDir: get('DATA_DIR') ?? './data',
     logLevel: logLevelRaw as LogLevel,
   };

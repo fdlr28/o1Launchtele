@@ -22,8 +22,11 @@ const SHUTDOWN_DRAIN_MS = 240_000;
 const SHUTDOWN_REPORT_MS = 15_000;
 /** bot.stop() waits for the running update handlers; a wedged one must not hold up the shutdown. */
 const BOT_STOP_MS = 10_000;
-/** How often unresolved launches are re-checked, so the owner hears when one turns out to have confirmed. */
-const SETTLE_WATCH_MS = 60_000;
+/**
+ * How often unresolved launches are re-checked, so the owner hears when one turns out to have confirmed.
+ * (O1_BOT_WATCH_INTERVAL_MS exists only so the end-to-end tests do not have to wait a minute.)
+ */
+const SETTLE_WATCH_MS = Number(process.env.O1_BOT_WATCH_INTERVAL_MS) || 60_000;
 /** A network that is down at boot must not turn into a crash loop that systemd gives up on: wait it out here. */
 const STARTUP_ATTEMPTS = 8;
 const STARTUP_RETRY_MS = 15_000;
@@ -58,7 +61,7 @@ async function main(): Promise<void> {
 
   const wallet = new ViemWallet(
     config.privateKey,
-    config.chainIds.map((chainId) => ({ chainId, rpcUrl: config.rpcUrls[chainId] as string })),
+    config.chainIds.map((chainId) => ({ chainId, rpcUrl: config.rpcUrls[chainId] as string, maxGasCostWei: config.maxGasCostWei[chainId] })),
     log,
   );
   for (let attempt = 1; ; attempt++) {
@@ -97,8 +100,10 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Messages the bot sends on its own; wired to the Telegram bot once that exists.
-  let notifyOwners: (text: string) => void = () => {};
+  // Messages the bot sends on its own. The Telegram bot does not exist yet while the history is first settled at
+  // startup, so early messages (a launch that confirmed while the bot was down) wait here and go out once it does.
+  const early: string[] = [];
+  let notifyOwners: (text: string) => void = (text) => void early.push(text);
   const launcher = new Launcher({
     api,
     catalog,
@@ -106,6 +111,7 @@ async function main(): Promise<void> {
     history,
     log,
     extraTargets: config.extraAllowedTargets,
+    maxCreationFeeWei: (chainId) => config.maxCreationFeeWei[chainId],
     onSettled: (entry, status) => notifyOwners(settledNotice(entry, status, config.explorerUrls)),
   });
   if (config.extraAllowedTargets.length > 0) {
@@ -132,6 +138,7 @@ async function main(): Promise<void> {
       void bot.api.sendMessage(userId, text, { link_preview_options: { is_disabled: true } }).catch(() => {});
     }
   };
+  for (const text of early.splice(0)) notifyOwners(text);
 
   // Whatever ends the process (a signal, or Telegram refusing to be polled) must not cut a launch in half:
   // stop taking new work, let the running launch finish and report, then exit.

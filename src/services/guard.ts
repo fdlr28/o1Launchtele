@@ -47,6 +47,12 @@ export interface GuardInput {
   maxTotalNativeValue: bigint;
   /** Extra contracts the owner explicitly trusts (EXTRA_ALLOWED_TARGETS): callable and usable as spender. */
   extraTargets?: readonly string[];
+  /**
+   * Tokens that belong to this plan (the pair, the fee token, later the launched token): they are never a target
+   * of a call, only of a bounded `approve`. Without this a hostile /config could name a token the wallet holds as
+   * "the factory" and have it transferred away.
+   */
+  neverCall?: ReadonlyArray<string>;
   nowSec?: () => number;
 }
 
@@ -62,6 +68,10 @@ export interface GuardPolicy {
   erc20: Map<string, Erc20Limit>;
   /** Lower-cased Permit2 deployments that are trusted (swap plans only). Never callable. */
   permit2: Set<string>;
+  /** The Permit2 address /config claims when it is neither canonical nor vouched for: only used for a helpful message. */
+  untrustedPermit2?: string;
+  /** Lower-cased tokens of this plan that may never be the target of a call. */
+  neverCall: Set<string>;
   maxTotalNativeValue: bigint;
   nowSec: () => number;
 }
@@ -69,6 +79,31 @@ export interface GuardPolicy {
 const APPROVE_SELECTOR = '0x095ea7b3';
 /** 0x + 4-byte selector + two 32-byte words. */
 const APPROVE_CALLDATA_LENGTH = 2 + 8 + 64 + 64;
+
+/**
+ * Functions that move, spend or authorise tokens. The call that launches a token or swaps for it starts with
+ * its own function (createLaunch, execute, ...), never with one of these, so a call that does is a token being
+ * emptied through a contract /config merely CALLED the factory or a router.
+ */
+const TOKEN_MOVING_SELECTORS: ReadonlyMap<string, string> = new Map([
+  ['0xa9059cbb', 'transfer'],
+  ['0x23b872dd', 'transferFrom'],
+  ['0x095ea7b3', 'approve'],
+  ['0x39509351', 'increaseAllowance'],
+  ['0xa457c2d7', 'decreaseAllowance'],
+  ['0x42842e0e', 'safeTransferFrom'],
+  ['0xb88d4fde', 'safeTransferFrom'],
+  ['0xf242432a', 'safeTransferFrom'],
+  ['0x2eb2c2d6', 'safeBatchTransferFrom'],
+  ['0xa22cb465', 'setApprovalForAll'],
+  ['0xd505accf', 'permit'],
+  ['0x42966c68', 'burn'],
+  ['0x79cc6790', 'burnFrom'],
+  ['0x4000aea0', 'transferAndCall'],
+  ['0x9bd9bbc6', 'send'],
+  ['0x36c78516', 'Permit2.transferFrom'],
+  ['0x87517c45', 'Permit2.approve'],
+]);
 
 /** A plan needs at most an approval or two plus the final call. */
 export const MAX_PLAN_STEPS = 4;
@@ -104,17 +139,28 @@ export function guardPolicyFor(input: GuardInput): GuardPolicy {
     spenders.add(extra);
   }
 
-  // Permit2 is only relevant for swaps. The canonical deployment is always trusted; the suite's own is trusted
-  // only when it IS the canonical one or the owner vouched for it. It may be a spender, never a call target.
+  // The canonical Permit2 is always trusted; the suite's own only when it IS the canonical one or the owner vouched
+  // for it. Whatever is trusted is NEVER a call target, in any plan (not even when the owner listed it in
+  // EXTRA_ALLOWED_TARGETS: a launch plan ending in Permit2.approve(token, attacker, max) must stay impossible).
+  // Only swaps may grant it an allowance.
+  const trustedPermit2 = new Set<string>([CANONICAL_PERMIT2]);
+  const claimed = isRealAddress(c.permit2) ? lower(c.permit2) : undefined;
+  if (claimed && extras.has(claimed)) trustedPermit2.add(claimed);
+  for (const address of trustedPermit2) {
+    callTargets.delete(address);
+    if (input.kind !== 'swap') spenders.delete(address);
+  }
   const permit2 = new Set<string>();
   if (input.kind === 'swap') {
-    permit2.add(CANONICAL_PERMIT2);
-    if (isRealAddress(c.permit2) && extras.has(lower(c.permit2))) permit2.add(lower(c.permit2));
+    for (const address of trustedPermit2) {
+      permit2.add(address);
+      spenders.add(address);
+    }
   }
-  for (const address of permit2) {
-    spenders.add(address);
-    callTargets.delete(address);
-  }
+  const untrustedPermit2 = claimed && !trustedPermit2.has(claimed) ? claimed : undefined;
+
+  const neverCall = new Set<string>();
+  addAll(neverCall, [...(input.neverCall ?? []), ...input.erc20.map((t) => t.address)]);
 
   const erc20 = new Map<string, Erc20Limit>();
   for (const token of input.erc20) {
@@ -130,9 +176,18 @@ export function guardPolicyFor(input: GuardInput): GuardPolicy {
     spenders,
     erc20,
     permit2,
+    untrustedPermit2,
+    neverCall,
     maxTotalNativeValue: input.maxTotalNativeValue,
     nowSec: input.nowSec ?? (() => Math.floor(Date.now() / 1000)),
   };
+}
+
+/** The same policy with more tokens that may never be called (e.g. the token a plan is about to create). */
+export function withNeverCall(policy: GuardPolicy, addresses: ReadonlyArray<string>): GuardPolicy {
+  const neverCall = new Set(policy.neverCall);
+  addAll(neverCall, [...addresses]);
+  return { ...policy, neverCall };
 }
 
 export interface SafeTx {
@@ -174,14 +229,27 @@ export function checkTx(tx: TransactionRequest, policy: GuardPolicy, label: stri
     if (value !== 0n) fail('approve tidak boleh membawa value.');
     const spender = lower(`0x${tx.data.slice(34, 74)}`);
     const amount = BigInt(`0x${tx.data.slice(74)}`);
-    if (!policy.spenders.has(spender)) fail(`spender approve ${spender} bukan kontrak yang diizinkan untuk langkah ini.`);
+    if (!policy.spenders.has(spender)) {
+      if (spender === policy.untrustedPermit2) {
+        fail(
+          `Permit2 yang dipakai chain ini (${spender}) bukan Permit2 kanonis (${CANONICAL_PERMIT2}) sehingga tidak dipercaya. ` +
+            'Kalau kamu sudah memverifikasi sendiri alamat itu, daftarkan di EXTRA_ALLOWED_TARGETS.',
+        );
+      }
+      fail(`spender approve ${spender} bukan kontrak yang diizinkan untuk langkah ini.`);
+    }
     if (!policy.permit2.has(spender) && amount > limit.maxApprove) {
       fail(`approve ${amount} melebihi batas ${limit.maxApprove} yang kamu setujui.`);
     }
     return { to: tx.to, data: tx.data, value, kind: 'approve' };
   }
 
-  if (policy.callTargets.has(target)) return { to: tx.to, data: tx.data, value, kind: 'call' };
+  if (policy.neverCall.has(target)) fail('tujuan adalah token milik rencana ini; token hanya boleh menerima approve, bukan panggilan.');
+  if (policy.callTargets.has(target)) {
+    const moving = TOKEN_MOVING_SELECTORS.get(selector);
+    if (moving) fail(`panggilan diawali fungsi token (${moving}), yang tidak pernah dipakai untuk ${policy.kind === 'launch' ? 'launch' : 'swap'}.`);
+    return { to: tx.to, data: tx.data, value, kind: 'call' };
+  }
 
   return fail(`tujuan ${tx.to} bukan kontrak yang boleh dipanggil pada langkah ${policy.kind === 'launch' ? 'launch' : 'swap'} ini.`);
 }

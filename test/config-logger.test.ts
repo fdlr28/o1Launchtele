@@ -115,6 +115,23 @@ describe('loadConfig', () => {
   });
 });
 
+describe('the owner can raise the safety ceilings (round-3 review)', () => {
+  it('reads MAX_GAS_COST_<id> and MAX_CREATION_FEE_<id> in native units, per chain', () => {
+    const cfg = loadConfig({ ...valid, MAX_GAS_COST_8453: '0.05', MAX_CREATION_FEE_8453: '0.02', MAX_CREATION_FEE_143: '250' });
+    expect(cfg.maxGasCostWei).toEqual({ 8453: 5n * 10n ** 16n });
+    expect(cfg.maxCreationFeeWei).toEqual({ 8453: 2n * 10n ** 16n, 143: 250n * 10n ** 18n });
+    expect(loadConfig(valid).maxGasCostWei).toEqual({});
+  });
+
+  it('rejects anything that is not a positive number', () => {
+    for (const bad of ['0', '-1', 'abc', '1e3', '0.0000000000000000001', '']) {
+      if (bad === '') continue; // an empty variable means "not set"
+      expect(errorOf({ ...valid, MAX_GAS_COST_8453: bad }), bad).toContain('MAX_GAS_COST_8453 harus angka positif');
+      expect(errorOf({ ...valid, MAX_CREATION_FEE_56: bad }), bad).toContain('MAX_CREATION_FEE_56 harus angka positif');
+    }
+  });
+});
+
 describe('secure URLs', () => {
   it('requires https for everything that carries a key or a token, except on this machine', () => {
     expect(errorOf({ ...valid, O1_API_BASE_URL: 'http://api.example.com/v1' })).toContain('O1_API_BASE_URL harus URL https://');

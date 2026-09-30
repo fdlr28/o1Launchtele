@@ -8,6 +8,7 @@ import {
   assertTypedDataAllowed,
   checkTx,
   guardPolicyFor,
+  withNeverCall,
   type GuardInput,
 } from '../src/services/guard.js';
 import type { ContractSuite, TransactionRequest, TypedDataRequest } from '../src/o1/types.js';
@@ -169,7 +170,8 @@ describe('the trust anchor: a hostile /config cannot buy an unlimited allowance 
 
   it('a hostile /config Permit2 is refused as spender when it is only claimed, and accepted when the owner vouches for it', () => {
     const claims = suiteWith({ permit2: ATTACKER });
-    expect(() => checkTx(approveTx(USDC, ATTACKER, 1n), swapPolicy({ suite: claims }), 'a')).toThrow(/spender/);
+    // the refusal explains itself, and says how to vouch for a chain whose Permit2 really is not the canonical one
+    expect(() => checkTx(approveTx(USDC, ATTACKER, 1n), swapPolicy({ suite: claims }), 'a')).toThrow(/bukan Permit2 kanonis.*EXTRA_ALLOWED_TARGETS/);
     const vouched = swapPolicy({ suite: claims, extraTargets: [ATTACKER] });
     expect(vouched.permit2.has(ATTACKER.toLowerCase())).toBe(true);
     expect(checkTx(approveTx(USDC, ATTACKER, maxUint256), vouched, 'a').kind).toBe('approve');
@@ -184,6 +186,61 @@ describe('the trust anchor: a hostile /config cannot buy an unlimited allowance 
 
   it('there is no Permit2 in a launch plan at all', () => {
     expect(launchPolicy().permit2.size).toBe(0);
+  });
+
+  it('Permit2 is never a call target in ANY plan, even when the owner listed it (round-3 review)', () => {
+    const grantToAttacker = encodeFunctionData({ abi: permit2Abi, functionName: 'approve', args: [USDC, ATTACKER, maxUint160, 2 ** 40] });
+    for (const extraTargets of [[], [PERMIT2], [PERMIT2.toLowerCase()]]) {
+      const launch = launchPolicy({ ...usdcFee(), extraTargets });
+      expect(launch.callTargets.has(PERMIT2.toLowerCase()), 'launch').toBe(false);
+      expect(() => checkTx(tx({ to: PERMIT2, value: '0', data: grantToAttacker }), launch, 'x'), 'launch').toThrow(refused);
+      const swap = swapPolicy({ extraTargets });
+      expect(() => checkTx(tx({ to: PERMIT2, value: '0', data: grantToAttacker }), swap, 'x'), 'swap').toThrow(refused);
+    }
+    // ... and a launch may not hand it an allowance either (nothing in a launch needs one)
+    expect(() => checkTx(approveTx(USDC, PERMIT2, 1n), launchPolicy({ ...usdcFee(), extraTargets: [PERMIT2] }), 'a')).toThrow(/spender/);
+  });
+});
+
+describe('a call may never be aimed at a token (round-3 review, HIGH)', () => {
+  const DAI = addr(0xda1);
+
+  it('refuses every token-moving function as the start of a call, however the target got into /config', () => {
+    const selectors: Array<[string, string]> = [
+      ['0xa9059cbb', 'transfer'], ['0x23b872dd', 'transferFrom'], ['0x095ea7b3', 'approve'], ['0x39509351', 'increaseAllowance'],
+      ['0x42842e0e', 'safeTransferFrom'], ['0xb88d4fde', 'safeTransferFrom'], ['0xf242432a', 'safeTransferFrom'], ['0x2eb2c2d6', 'safeBatchTransferFrom'],
+      ['0xa22cb465', 'setApprovalForAll'], ['0xd505accf', 'permit'], ['0x42966c68', 'burn'], ['0x79cc6790', 'burnFrom'], ['0x4000aea0', 'transferAndCall'],
+    ];
+    for (const [selector, name] of selectors) {
+      const data = `${selector}${'00'.repeat(64)}` as `0x${string}`;
+      expect(() => checkTx(tx({ data, value: '0' }), launchPolicy(), 'x'), `launch ${name}`).toThrow(new RegExp(`fungsi token \\(${name}\\)`));
+      expect(() => checkTx(tx({ to: ROUTER, data, value: '0' }), swapPolicy(), 'x'), `swap ${name}`).toThrow(/fungsi token/);
+    }
+    // the real thing: the owner's whole DAI balance, "sent" to an attacker by calling the "factory" (which /config made a token)
+    const hostile = suiteWith({ factory: DAI });
+    expect(() => checkTx(tx({ to: DAI, data: transfer(ATTACKER), value: '0' }), launchPolicy({ suite: hostile }), 'x')).toThrow(/fungsi token \(transfer\)/);
+    // an ordinary launch or router call does not start with one of them
+    expect(checkTx(tx({ data: '0x3593564c00' }), launchPolicy(), 'x').kind).toBe('call');
+  });
+
+  it('refuses a call to the pair, the fee token, or any token named by the plan, even with an innocent-looking selector', () => {
+    const innocent = '0x12345678' as const;
+    // a USDC pair on a native-fee launch: USDC is not approvable, and not callable either
+    const launch = launchPolicy({ neverCall: [USDC] });
+    expect(() => checkTx(tx({ to: USDC, data: innocent, value: '0' }), launch, 'x')).toThrow(/token milik rencana/);
+    expect(() => checkTx(approveTx(USDC, FACTORY, 1n), launch, 'x')).toThrow(/token milik rencana/);
+    // the token a plan is about to create
+    const withToken = withNeverCall(launchPolicy({ extraTargets: [addr(0x7701)] }), [addr(0x7701)]);
+    expect(() => checkTx(tx({ to: addr(0x7701), data: innocent, value: '0' }), withToken, 'x')).toThrow(/token milik rencana/);
+    // tokens with an allowance bound are never callable either (approve only)
+    expect(() => checkTx(tx({ to: USDC, data: innocent, value: '0' }), launchPolicy(usdcFee()), 'x')).toThrow(/hanya boleh menerima approve/);
+  });
+
+  it('withNeverCall leaves the original policy alone', () => {
+    const base = launchPolicy();
+    const derived = withNeverCall(base, [DAI]);
+    expect(base.neverCall.has(DAI.toLowerCase())).toBe(false);
+    expect(derived.neverCall.has(DAI.toLowerCase())).toBe(true);
   });
 });
 

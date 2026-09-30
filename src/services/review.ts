@@ -6,7 +6,7 @@ import { describeError } from '../errors.js';
 import { isNativeQuote, type Catalog } from '../o1/catalog.js';
 import { draftProblems } from '../o1/launchRequest.js';
 import type { Wallet } from '../wallet/wallet.js';
-import { resolveLaunchContext, type LaunchContext } from './context.js';
+import { creationFeeCap, resolveLaunchContext, type LaunchContext } from './context.js';
 import { DraftAlreadyLaunchedError, NO_FEE, PendingLaunchError, contractsOf, type Launcher, type ReviewedContracts, type ReviewedFee } from './launcher.js';
 
 /** One line of the funds check: what the wallet holds against what the launch needs. */
@@ -34,6 +34,8 @@ export interface Review {
 export interface ReviewDeps {
   catalog: Catalog;
   wallet: Wallet;
+  /** The owner's override of the creation fee ceiling per chain (MAX_CREATION_FEE_<id>). */
+  maxCreationFeeWei?: (chainId: number) => bigint | undefined;
   launcher: Pick<Launcher, 'pendingLaunches' | 'priorLaunch'>;
 }
 
@@ -45,9 +47,18 @@ export async function buildReview(deps: ReviewDeps, draft: Draft): Promise<Revie
   // A missing pair is reported once by draftProblems below.
   if (draft.quote) {
     try {
-      ctx = await resolveLaunchContext(deps.catalog, draft);
+      ctx = await resolveLaunchContext(deps.catalog, draft, { tokenDecimals: (token) => deps.wallet.erc20Decimals(draft.chainId, token) });
     } catch (err) {
       problems.push(describeError(err));
+    }
+  }
+  if (ctx?.fee?.isNative) {
+    const cap = creationFeeCap(draft.chainId, deps.maxCreationFeeWei);
+    if (ctx.fee.amountRaw > cap) {
+      problems.push(
+        `Creation fee ${formatAmount(ctx.fee.amountRaw, ctx.nativeDecimals)} ${ctx.nativeSymbol} melebihi batas keamanan bot (${formatAmount(cap, ctx.nativeDecimals)} ${ctx.nativeSymbol}). ` +
+          `Kalau o1 memang menaikkan fee, naikkan batasnya dengan MAX_CREATION_FEE_${draft.chainId} di .env setelah kamu memverifikasinya.`,
+      );
     }
   }
   problems.push(...draftProblems(draft, ctx?.suite));

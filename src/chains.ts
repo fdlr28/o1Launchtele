@@ -12,10 +12,16 @@ export interface ChainInfo {
    * launch (tens of times), but far below what a broken or hostile RPC could make the wallet burn.
    */
   maxGasCostWei: bigint;
+  /**
+   * Most a creation fee may be in the chain's native currency (wei). The API's own number is not trusted: a decimals
+   * field that lies could make a whole balance look like a rounding error. Roughly 10x the documented fee.
+   */
+  maxCreationFeeWei: bigint;
 }
 
-/** Applies to chains that are not in the table below. */
+/** Apply to chains that are not in the table below. */
 export const DEFAULT_MAX_GAS_COST_WEI = 10n ** 18n;
+export const DEFAULT_MAX_CREATION_FEE_WEI = 10n ** 17n;
 
 /**
  * Chains supported by the o1 Launchpad public API (docs.o1.exchange/launchpad/api/introduction).
@@ -32,6 +38,7 @@ export const CHAINS: Record<number, ChainInfo> = {
     defaultRpc: 'https://mainnet.base.org',
     explorer: 'https://basescan.org',
     maxGasCostWei: 10n ** 16n, // 0.01 ETH
+    maxCreationFeeWei: 10n ** 16n, // 0.01 ETH (fee today: 0.001)
   },
   4663: {
     id: 4663,
@@ -40,6 +47,7 @@ export const CHAINS: Record<number, ChainInfo> = {
     nativeDecimals: 18,
     explorer: 'https://rh-scan.com',
     maxGasCostWei: 10n ** 16n, // 0.01 ETH
+    maxCreationFeeWei: 10n ** 16n, // 0.01 ETH (fee today: 0.001)
   },
   143: {
     id: 143,
@@ -48,13 +56,16 @@ export const CHAINS: Record<number, ChainInfo> = {
     nativeDecimals: 18,
     defaultRpc: 'https://rpc.monad.xyz',
     maxGasCostWei: 20n * 10n ** 18n, // 20 MON
+    maxCreationFeeWei: 1000n * 10n ** 18n, // 1000 MON (fee today: 100)
   },
   5042: {
     id: 5042,
     name: 'Arc',
     nativeSymbol: 'USDC',
     nativeDecimals: 18,
-    maxGasCostWei: 2n * 10n ** 18n, // 2 USDC (Arc pays gas in USDC)
+    // Arc pays gas in USDC at a few hundred "gwei" per gas, so a launch costs a USDC or two, not cents.
+    maxGasCostWei: 20n * 10n ** 18n, // 20 USDC
+    maxCreationFeeWei: 20n * 10n ** 18n, // 20 USDC (fee today: 2)
   },
   56: {
     id: 56,
@@ -63,7 +74,8 @@ export const CHAINS: Record<number, ChainInfo> = {
     nativeDecimals: 18,
     defaultRpc: 'https://bsc-dataseed.binance.org',
     explorer: 'https://bscscan.com',
-    maxGasCostWei: 5n * 10n ** 16n, // 0.05 BNB
+    maxGasCostWei: 10n ** 17n, // 0.1 BNB
+    maxCreationFeeWei: 5n * 10n ** 16n, // 0.05 BNB (fee today: 0.003)
   },
   196: {
     id: 196,
@@ -73,6 +85,7 @@ export const CHAINS: Record<number, ChainInfo> = {
     defaultRpc: 'https://rpc.xlayer.tech',
     explorer: 'https://xlayerscan.com',
     maxGasCostWei: 5n * 10n ** 17n, // 0.5 OKB
+    maxCreationFeeWei: 5n * 10n ** 17n, // 0.5 OKB (fee today: 0.02)
   },
 };
 

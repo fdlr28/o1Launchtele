@@ -489,6 +489,71 @@ describe('review', () => {
     expect(h.panelText()).toContain(`Router swap: <code>${ROUTER}</code>`);
   });
 
+  describe('amounts come from the chain, not from what the API claims (round-3 review)', () => {
+    it('an ERC-20 pair is shown with its token address and the decimals that were checked against the contract', async () => {
+      await fillBasics();
+      await h.press('nav:pair');
+      await h.press(`pair:pick:${USDC}`);
+      await h.press('nav:review');
+      expect(h.panelText()).toContain(`Token pair USDC: <code>${USDC}</code> (6 desimal, sudah dicocokkan dengan kontraknya)`);
+      expect(h.hasButton('go:launch')).toBe(true);
+    });
+
+    it('a native pair has no token line', async () => {
+      await fillBasics();
+      await h.press('nav:review');
+      expect(h.panelText()).not.toContain('Token pair');
+    });
+
+    it('blocks when the API says another number of decimals than the token contract does', async () => {
+      await fillBasics();
+      await h.press('nav:pair');
+      await h.press(`pair:pick:${USDC}`);
+      h.wallet.tokenDecimals.set(USDC.toLowerCase(), 18);
+      await h.press('nav:review');
+      expect(h.panelText()).toContain('Desimal pair USDC menurut API o1 (6)');
+      expect(h.panelText()).toContain(`kontrak token ${USDC} (18)`);
+      expect(h.hasButton('go:launch')).toBe(false);
+      expect(h.state().reviewed).toBeNull();
+    });
+
+    it('shows the fee token address, and blocks a creation fee whose decimals lie', async () => {
+      const cfg = configFor('tax');
+      cfg.suites![0]!.creation_fee = { amount_raw: '5000000', currency: USDC, symbol: 'USDC', decimals: 6 };
+      h.api.configs.tax = cfg;
+      await fillBasics();
+      await h.press('nav:review');
+      expect(h.panelText()).toContain('Creation fee: 5 USDC');
+      expect(h.panelText()).toContain(`Token fee: <code>${USDC}</code>`);
+
+      cfg.suites![0]!.creation_fee = { amount_raw: (10n ** 18n).toString(), currency: ZERO, symbol: 'ETH', decimals: 24 };
+      const fresh = createHarness();
+      fresh.files.set('img1', PNG_BYTES);
+      fresh.api.configs.tax = cfg;
+      h = fresh;
+      await fillBasics();
+      await h.press('nav:review');
+      expect(h.panelText()).toContain('Desimal creation fee menurut API o1 (24)');
+      expect(h.hasButton('go:launch')).toBe(false);
+    });
+
+    it('blocks a creation fee above the ceiling, and lets the owner raise the ceiling on purpose', async () => {
+      const cfg = configFor('tax');
+      cfg.suites![0]!.creation_fee = { amount_raw: (10n ** 18n).toString(), currency: ZERO, symbol: 'ETH', decimals: 18 }; // 1 ETH on Base
+      h.api.configs.tax = cfg;
+      await fillBasics();
+      await h.press('nav:review');
+      expect(h.panelText()).toContain('melebihi batas keamanan bot (0.01 ETH)');
+      expect(h.panelText()).toContain('MAX_CREATION_FEE_8453');
+      expect(h.hasButton('go:launch')).toBe(false);
+
+      h.config.maxCreationFeeWei[8453] = 2n * 10n ** 18n;
+      await h.press('nav:review');
+      expect(h.panelText()).not.toContain('melebihi batas keamanan bot');
+      expect(h.hasButton('go:launch')).toBe(true);
+    });
+  });
+
   it('refuses a green light when the history cannot be read', async () => {
     mkdirSync(join(h.dataDir, 'launches.jsonl'), { recursive: true }); // EISDIR, not "no history"
     await fillBasics();

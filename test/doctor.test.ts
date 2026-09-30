@@ -10,7 +10,7 @@ function makeDeps(overrides: Partial<DoctorDeps> = {}) {
   const tokenIndexed = vi.fn(async () => false);
   const getConfig = vi.fn(async (_chain: number, opts: { product: 'tax' | 'non-tax' }) => configFor(opts.product));
   const deps: DoctorDeps = {
-    config: { allowedUserIds: new Set([1, 2]), dataDir: '/srv/o1bot/data' },
+    config: { allowedUserIds: new Set([1, 2]), dataDir: '/srv/o1bot/data', extraAllowedTargets: [], maxCreationFeeWei: {} },
     history: { assertWritable: async () => {}, pending: async () => [] },
     telegramGetMe: async () => ({ username: 'my_bot' }),
     wallet: {
@@ -60,6 +60,43 @@ describe('runDoctor', () => {
     const pending = await runDoctor(makeDeps({ history: { assertWritable: async () => {}, pending: async () => [{ chainId: 8453, name: 'Old Coin', txHash: '0xabc' }] } }).deps);
     expect(pending.ok).toBe(true); // a warning, not a blocker for starting the bot
     expect(text(pending.lines)).toContain('⚠️ Ada 1 launch yang hasilnya belum jelas (Old Coin 0xabc)');
+  });
+
+  it('warns when a chain uses a Permit2 that is not the canonical one, unless the owner vouched for it', async () => {
+    const odd = '0x00000000000000000000000000000000000abcde';
+    const oddConfig = (product: 'tax' | 'non-tax') => {
+      const cfg = configFor(product);
+      cfg.suites![0]!.contracts.permit2 = odd;
+      return cfg;
+    };
+    const getConfig = vi.fn(async (_chain: number, opts: { product: 'tax' | 'non-tax' }) => oddConfig(opts.product));
+    const warned = await runDoctor(makeDeps({ api: { ping: async () => {}, tokenIndexed: async () => false, getConfig } as unknown as DoctorDeps['api'] }).deps);
+    expect(text(warned.lines)).toContain('Permit2 chain ini (0x00000000000000000000000000000000000abcde) bukan Permit2 kanonis');
+    expect(warned.ok).toBe(true); // a warning: native dev buys and launches are unaffected
+
+    const vouched = await runDoctor(
+      makeDeps({
+        api: { ping: async () => {}, tokenIndexed: async () => false, getConfig } as unknown as DoctorDeps['api'],
+        config: { allowedUserIds: new Set([1]), dataDir: '/d', extraAllowedTargets: [odd], maxCreationFeeWei: {} },
+      }).deps,
+    );
+    expect(text(vouched.lines)).not.toContain('bukan Permit2 kanonis');
+    // the canonical one (the fixture's default) is silent
+    expect(text((await runDoctor(makeDeps().deps)).lines)).not.toContain('Permit2');
+  });
+
+  it('warns when a native creation fee is above the bot\'s ceiling, and shows it with the chain\'s own decimals', async () => {
+    const pricey = () => {
+      const cfg = configFor('tax');
+      cfg.suites![0]!.creation_fee = { amount_raw: (10n ** 18n).toString(), currency: '0x0000000000000000000000000000000000000000', symbol: 'ETH', decimals: 24 };
+      return cfg;
+    };
+    const getConfig = vi.fn(async () => pricey());
+    const report = await runDoctor(makeDeps({ api: { ping: async () => {}, tokenIndexed: async () => false, getConfig } as unknown as DoctorDeps['api'] }).deps);
+    const out = text(report.lines);
+    expect(out).toContain('creation fee 1 ETH'); // not "0.000001" because the API claimed 24 decimals
+    expect(out).toContain('creation fee melebihi batas keamanan bot');
+    expect(out).toContain('MAX_CREATION_FEE_8453');
   });
 
   it('fails on a rejected Telegram token', async () => {

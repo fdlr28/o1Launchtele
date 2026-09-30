@@ -16,6 +16,7 @@ let wallet: ViemWallet;
 
 beforeEach(async () => {
   rpc = new MockRpc(8453);
+  rpc.tokens.set(USDC.toLowerCase(), 6);
   await rpc.start();
   wallet = new ViemWallet(KEY, [{ chainId: 8453, rpcUrl: rpc.url }]);
   await wallet.verifyChains();
@@ -187,6 +188,39 @@ describe('gas cost is capped (round-2 review)', () => {
   it('signs at ordinary fees, also on a busy chain', async () => {
     rpc.priorityFee = 50_000_000_000; // 50 gwei: 115k gas x ~51 gwei = 0.006 ETH, under the 0.01 ETH cap
     await expect(wallet.sign(8453, TX)).resolves.toBeDefined();
+  });
+});
+
+describe('what the chain says about tokens (round-3 review)', () => {
+  it('reads decimals from the token contract, and remembers them', async () => {
+    expect(await wallet.erc20Decimals(8453, USDC)).toBe(6);
+    rpc.tokens.set(USDC.toLowerCase(), 18); // changes on the node ...
+    expect(await wallet.erc20Decimals(8453, USDC)).toBe(6); // ... but decimals never change, so the answer is kept
+    await expect(wallet.erc20Decimals(8453, FACTORY)).rejects.toThrow(); // not a token: no answer at all
+  });
+
+  it('recognises an ERC-20 by its behaviour, and a factory or router as not one', async () => {
+    expect(await wallet.isTokenLike(8453, USDC)).toBe(true);
+    expect(await wallet.isTokenLike(8453, FACTORY)).toBe(false); // answers nothing to decimals()
+    expect(await wallet.isTokenLike(8453, '0x00000000000000000000000000000000000000ff')).toBe(false);
+  });
+
+  it('cannot tell when the RPC itself is unreachable, and says so instead of answering "no"', async () => {
+    await rpc.stop();
+    await expect(wallet.isTokenLike(8453, FACTORY)).rejects.toThrow();
+    await rpc.start();
+  });
+
+  it('honours the owner\'s own gas ceiling for a chain', async () => {
+    const strict = new ViemWallet(KEY, [{ chainId: 8453, rpcUrl: rpc.url, maxGasCostWei: 1_000n }]);
+    await strict.verifyChains();
+    const err = await strict.sign(8453, TX).catch((e) => e);
+    expect(err).toBeInstanceOf(UserFacingError);
+    expect(err.message).toContain('melebihi batas keamanan');
+    const generous = new ViemWallet(KEY, [{ chainId: 8453, rpcUrl: rpc.url, maxGasCostWei: 10n ** 20n }]);
+    await generous.verifyChains();
+    rpc.priorityFee = 500_000_000_000; // refused by the built-in ceiling, allowed by the owner's
+    await expect(generous.sign(8453, TX)).resolves.toBeDefined();
   });
 });
 

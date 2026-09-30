@@ -218,13 +218,24 @@ interface Stack {
   stop: () => Promise<void>;
 }
 
-async function boot(opts: { seedHistory?: string; prepareDelayMs?: number } = {}): Promise<Stack> {
+async function boot(
+  opts: {
+    seedHistory?: string;
+    prepareDelayMs?: number;
+    env?: Record<string, string>;
+    /** Runs against the mock node before the bot starts. */
+    prepare?: (rpc: MockRpc) => void;
+    /** False when the process is expected to leave before it ever polls Telegram. */
+    waitForPolling?: boolean;
+  } = {},
+): Promise<Stack> {
   const tg = new MockTelegram();
   const o1 = new MockO1();
   const rpc = new MockRpc(8453);
   await Promise.all([tg.start(), o1.start(), rpc.start()]);
   rpc.codeAddresses.add(TOKEN.toLowerCase());
   o1.prepareDelayMs = opts.prepareDelayMs ?? 0;
+  opts.prepare?.(rpc);
   const dataDir = tempDir();
   if (opts.seedHistory) writeFileSync(join(dataDir, 'launches.jsonl'), opts.seedHistory);
 
@@ -243,6 +254,7 @@ async function boot(opts: { seedHistory?: string; prepareDelayMs?: number } = {}
     DATA_DIR: dataDir,
     LOG_LEVEL: 'debug',
     NODE_ENV: 'test',
+    ...opts.env,
   });
   const child = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts'], { cwd: join(import.meta.dirname, '..'), env });
   let out = '';
@@ -255,9 +267,11 @@ async function boot(opts: { seedHistory?: string; prepareDelayMs?: number } = {}
       if (!predicate()) throw new Error(`waiting for: ${what}\n--- panel ---\n${tg.panelText()}\n--- bot output ---\n${out.slice(-1500)}`);
     }, { timeout, interval: 50 });
 
-  await vi.waitFor(() => {
-    if (tg.polls === 0) throw new Error(`bot not polling yet\n${out}`);
-  }, { timeout: 30_000, interval: 100 });
+  if (opts.waitForPolling !== false) {
+    await vi.waitFor(() => {
+      if (tg.polls === 0) throw new Error(`bot not polling yet\n${out}`);
+    }, { timeout: 30_000, interval: 100 });
+  }
 
   const fillAndReview = async () => {
     tg.command('launch');
@@ -378,6 +392,52 @@ describe('end to end: shutdown and crash recovery (real process)', () => {
     expect(lines.map((l) => l.status)).toEqual(['sent', 'confirmed']);
     expect(tg.panelText()).toContain('Launch berhasil');
   }, 90_000);
+
+  it('an unclear launch that confirms later is announced by the watcher, and closes its draft (the recovery path, end to end)', async () => {
+    const hash = `0x${'c1'.repeat(32)}`;
+    stack = await boot({
+      env: { O1_BOT_WATCH_INTERVAL_MS: '300' },
+      seedHistory:
+        JSON.stringify({ ts: new Date().toISOString(), kind: 'launch', status: 'unknown', chainId: 8453, name: 'Late Coin', symbol: 'LATE', token: TOKEN, txHash: hash, draftId: 'late-draft' }) + '\n',
+    });
+    const { tg, rpc, until } = stack;
+    await until(() => tg.calls.some((c) => String(c.payload.text ?? '').includes('Bot baru saja menyala')), 'startup warning (still unresolved)');
+
+    rpc.addMinedTransaction(hash as never); // the chain finally shows it
+    await until(() => tg.calls.some((c) => String(c.payload.text ?? '').includes('ternyata BERHASIL')), 'the watcher announces the late confirmation', 15_000);
+    const notice = String(tg.calls.find((c) => String(c.payload.text ?? '').includes('ternyata BERHASIL'))?.payload.text);
+    expect(notice).toContain('Late Coin ($LATE)');
+    expect(notice).toContain(`Token: ${TOKEN}`);
+    expect(notice).toContain(`https://basescan.org/tx/${hash}`);
+    expect(notice).toContain('tidak bisa diluncurkan lagi');
+    // announced once, however many ticks follow
+    await new Promise((resolve) => setTimeout(resolve, 1_200));
+    expect(tg.calls.filter((c) => String(c.payload.text ?? '').includes('ternyata BERHASIL'))).toHaveLength(1);
+    const lines = readFileSync(join(stack.dataDir, 'launches.jsonl'), 'utf8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
+    expect(lines.map((l) => l.status)).toEqual(['unknown', 'confirmed']);
+  }, 60_000);
+
+  it('a launch that confirmed while the bot was down is announced as soon as the bot is up (not lost before Telegram exists)', async () => {
+    const hash = `0x${'c2'.repeat(32)}`;
+    stack = await boot({
+      prepare: (rpc) => rpc.addMinedTransaction(hash as never),
+      seedHistory: JSON.stringify({ ts: new Date().toISOString(), kind: 'launch', status: 'sent', chainId: 8453, name: 'Down Coin', symbol: 'DOWN', token: TOKEN, txHash: hash }) + '\n',
+    });
+    await stack.until(() => stack!.tg.calls.some((c) => String(c.payload.text ?? '').includes('ternyata BERHASIL')), 'early notice delivered');
+    expect(String(stack.tg.calls.find((c) => String(c.payload.text ?? '').includes('ternyata BERHASIL'))?.payload.text)).toContain('Down Coin');
+    expect(stack.tg.calls.some((c) => String(c.payload.text ?? '').includes('Bot baru saja menyala'))).toBe(false); // nothing is unresolved any more
+  }, 60_000);
+
+  it('refuses to start, saying why, when the launch log cannot be written', async () => {
+    const notADirectory = join(tempDir(), 'data');
+    writeFileSync(notADirectory, 'a file where the data folder should be');
+    stack = await boot({ env: { DATA_DIR: notADirectory }, waitForPolling: false });
+    const code = await Promise.race([stack.exited, new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 20_000))]);
+    expect(code).toBe(1);
+    expect(stack.output()).toContain('tidak bisa ditulis');
+    expect(stack.output()).toContain('bot tidak akan mengirim transaksi apa pun');
+    expect(stack.tg.polls).toBe(0);
+  }, 60_000);
 
   it('refuses to start with a plain-http o1 API URL, naming the problem and leaking nothing', async () => {
     const tg = new MockTelegram();

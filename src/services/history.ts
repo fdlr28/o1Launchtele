@@ -30,7 +30,11 @@ export interface HistoryEntry {
 export class History {
   private readonly file: string;
 
-  constructor(private readonly dir: string) {
+  constructor(
+    private readonly dir: string,
+    /** Injectable so a test can make the disk misbehave. */
+    private readonly openFile: typeof open = open,
+  ) {
     this.file = join(dir, 'launches.jsonl');
   }
 
@@ -52,10 +56,18 @@ export class History {
   async append(entry: Omit<HistoryEntry, 'ts'>): Promise<void> {
     await mkdir(this.dir, { recursive: true, mode: 0o700 });
     const line: HistoryEntry = { ts: new Date().toISOString(), ...entry };
-    const handle = await open(this.file, 'a', 0o600);
+    const data = Buffer.from(`\n${JSON.stringify(line)}\n`);
+    const handle = await this.openFile(this.file, 'a', 0o600);
     try {
       // The leading newline keeps this record readable even when a crash left the previous one half written.
-      await handle.write(`\n${JSON.stringify(line)}\n`);
+      // FileHandle.write may write fewer bytes than asked (a full disk, a file size limit) WITHOUT an error, so the
+      // write is repeated until everything is out; if the disk refuses the rest, that is an error, and nothing is sent.
+      let written = 0;
+      while (written < data.length) {
+        const { bytesWritten } = await handle.write(data, written, data.length - written, null);
+        if (bytesWritten <= 0) throw new Error(`short write to the launch log (${written} of ${data.length} bytes)`);
+        written += bytesWritten;
+      }
       await handle.sync();
     } finally {
       await handle.close();
