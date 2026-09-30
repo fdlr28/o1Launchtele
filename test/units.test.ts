@@ -109,6 +109,15 @@ describe('parseTokenAmount', () => {
 });
 
 describe('formatAmount', () => {
+  it('never shows a small non-zero amount as zero', () => {
+    expect(formatAmount(1n, 18)).toBe('<0.000001');
+    expect(formatAmount(100_000_000_000n, 18)).toBe('<0.000001'); // 1e-7
+    expect(formatAmount(1n, 6)).toBe('0.000001'); // exactly representable
+    expect(formatAmount(50n, 18, 4)).toBe('<0.0001');
+    expect(formatAmount(0n, 18)).toBe('0');
+    expect(formatAmount(1_500_000_000_000n, 18)).toBe('0.000001'); // shown digits are truncated, never rounded up
+  });
+
   it('trims trailing zeros and caps fraction digits', () => {
     expect(formatAmount(1_000_000_000_000_000n, 18)).toBe('0.001');
     expect(formatAmount(1_500_000n, 6)).toBe('1.5');

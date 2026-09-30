@@ -10,7 +10,8 @@ function makeDeps(overrides: Partial<DoctorDeps> = {}) {
   const tokenIndexed = vi.fn(async () => false);
   const getConfig = vi.fn(async (_chain: number, opts: { product: 'tax' | 'non-tax' }) => configFor(opts.product));
   const deps: DoctorDeps = {
-    config: { allowedUserIds: new Set([1, 2]) },
+    config: { allowedUserIds: new Set([1, 2]), dataDir: '/srv/o1bot/data' },
+    history: { assertWritable: async () => {}, pending: async () => [] },
     telegramGetMe: async () => ({ username: 'my_bot' }),
     wallet: {
       address: WALLET,
@@ -42,6 +43,23 @@ describe('runDoctor', () => {
     expect(out).toContain('Base · Standard: siap');
     expect(out).toContain('Siap. Jalankan bot dengan: npm start');
     expect(out).toContain('launches:prepare, swaps:quote, swaps:prepare tidak bisa dicek');
+  });
+
+  it('checks that the launch log can be written and read, and mentions unresolved launches', async () => {
+    const ok = await runDoctor(makeDeps().deps);
+    expect(text(ok.lines)).toContain('✅ Folder data bisa ditulis (/srv/o1bot/data)');
+
+    const readonly = await runDoctor(makeDeps({ history: { assertWritable: async () => { throw new Error('EACCES: permission denied'); }, pending: async () => [] } }).deps);
+    expect(readonly.ok).toBe(false);
+    expect(text(readonly.lines)).toContain('❌ Folder data (/srv/o1bot/data) tidak bisa ditulis: Terjadi kesalahan: EACCES');
+
+    const unreadable = await runDoctor(makeDeps({ history: { assertWritable: async () => {}, pending: async () => { throw new Error('EISDIR'); } } }).deps);
+    expect(unreadable.ok).toBe(false);
+    expect(text(unreadable.lines)).toContain('❌ Riwayat launch tidak bisa dibaca');
+
+    const pending = await runDoctor(makeDeps({ history: { assertWritable: async () => {}, pending: async () => [{ chainId: 8453, name: 'Old Coin', txHash: '0xabc' }] } }).deps);
+    expect(pending.ok).toBe(true); // a warning, not a blocker for starting the bot
+    expect(text(pending.lines)).toContain('⚠️ Ada 1 launch yang hasilnya belum jelas (Old Coin 0xabc)');
   });
 
   it('fails on a rejected Telegram token', async () => {

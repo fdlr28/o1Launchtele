@@ -225,6 +225,16 @@ export function reviewText(draft: Draft, review: Review, chainName: string, wall
   }
   lines.push(`  Wallet: ${code(shortAddress(wallet))}`);
 
+  if (review.contracts) {
+    const c = review.contracts;
+    lines.push('', '🔗 <b>Kontrak o1 yang menerima dana</b> (dari API o1, cocokkan dengan alamat resmi o1)');
+    lines.push(`  Factory: ${code(c.factory)}`);
+    if (draft.devBuy.enabled) {
+      if (c.swapRouter) lines.push(`  Router swap: ${code(c.swapRouter)}`);
+      if (c.universalRouter) lines.push(`  Universal router: ${code(c.universalRouter)}`);
+    }
+  }
+
   lines.push('', '🔒 Supply tetap 1 miliar token; likuiditas dikunci permanen oleh kontrak o1.');
 
   if (review.warnings.length) lines.push('', ...review.warnings.map((w) => `⚠️ ${esc(w)}`));
@@ -289,6 +299,10 @@ export function resultText(draft: Draft, outcome: LaunchOutcome, chainName: stri
     if (outcome.devBuy.status === 'done') {
       const amount = draft.devBuy.amountRaw && draft.quote ? `${formatAmount(BigInt(draft.devBuy.amountRaw), draft.quote.decimals)} ${draft.quote.symbol}` : '';
       lines.push(`💰 Dev buy: ✅ ${esc(amount)} — ${link(shortAddress(outcome.devBuy.txHash), explorer('tx', outcome.devBuy.txHash))}`);
+    } else if (outcome.devBuy.unknown) {
+      lines.push(`💰 Dev buy: ❓ hasilnya belum jelas — ${esc(outcome.devBuy.reason)}`);
+      if (outcome.devBuy.txHash) lines.push(`Tx: ${link(shortAddress(outcome.devBuy.txHash), explorer('tx', outcome.devBuy.txHash))}`);
+      lines.push('<i>Swap-nya sudah dikirim dan mungkin masih masuk. Cek hash di explorer SEBELUM membeli manual, supaya tidak dobel.</i>');
     } else {
       lines.push(`💰 Dev buy: ⚠️ gagal — ${esc(outcome.devBuy.reason)}`);
       if (outcome.devBuy.txHash) lines.push(`Tx: ${link(shortAddress(outcome.devBuy.txHash), explorer('tx', outcome.devBuy.txHash))}`);
@@ -301,9 +315,16 @@ export function resultText(draft: Draft, outcome: LaunchOutcome, chainName: stri
   return clip(lines.join('\n'));
 }
 
-export function failureText(message: string, txHash: string | undefined, explorer: Explorer): string {
-  const lines = ['❌ <b>Launch gagal</b>', '', esc(message)];
+export function failureText(message: string, txHash: string | undefined, explorer: Explorer, opts: { unknown?: boolean } = {}): string {
+  const lines = [opts.unknown ? '⚠️ <b>Hasil launch belum jelas</b>' : '❌ <b>Launch gagal</b>', '', esc(message)];
   if (txHash) lines.push('', `Tx: ${link(shortAddress(txHash), explorer('tx', txHash))} ${code(txHash)}`);
-  lines.push('', '<i>Draft-mu masih tersimpan. Perbaiki lalu Review ulang.</i>');
+  if (opts.unknown) {
+    lines.push(
+      '',
+      '<b>Jangan launch ulang.</b> Transaksinya sudah dikirim dan mungkin masih terkonfirmasi. Bot memblokir launch baru sampai hasilnya jelas dan akan memberi tahu kamu begitu terkonfirmasi. Cek juga di explorer; jika yakin tidak akan terkonfirmasi, kirim <code>/dismiss ya</code>.',
+    );
+  } else {
+    lines.push('', '<i>Draft-mu masih tersimpan. Perbaiki lalu Review ulang.</i>');
+  }
   return clip(lines.join('\n'));
 }

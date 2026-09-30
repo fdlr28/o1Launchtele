@@ -12,7 +12,12 @@ import type { ChainCheck } from './wallet/wallet.js';
 const PROBE_ADDRESS = '0x000000000000000000000000000000000000dEaD' as const;
 
 export interface DoctorDeps {
-  config: Pick<AppConfig, 'allowedUserIds'>;
+  config: Pick<AppConfig, 'allowedUserIds' | 'dataDir'>;
+  /** The launch log: it must be writable (no transaction is sent without a durable record) and may hold unresolved launches. */
+  history: {
+    assertWritable(): Promise<void>;
+    pending(): Promise<Array<{ txHash?: string; chainId: number; name?: string; symbol?: string }>>;
+  };
   telegramGetMe: () => Promise<{ username?: string }>;
   wallet: {
     address: string;
@@ -61,6 +66,25 @@ export async function runDoctor(deps: DoctorDeps): Promise<DoctorReport> {
   }
   pass(`${deps.config.allowedUserIds.size} user Telegram diizinkan`);
   pass(`Wallet launcher: ${deps.wallet.address}`);
+
+  // 1b. The launch log
+  try {
+    await deps.history.assertWritable();
+    pass(`Folder data bisa ditulis (${deps.config.dataDir})`);
+  } catch (err) {
+    fail(`Folder data (${deps.config.dataDir}) tidak bisa ditulis: ${short(err)}. Tanpa catatan riwayat, bot tidak akan mengirim transaksi apa pun.`);
+  }
+  try {
+    const pending = await deps.history.pending();
+    if (pending.length > 0) {
+      warn(
+        `Ada ${pending.length} launch yang hasilnya belum jelas (${pending.map((e) => `${e.name ?? '?'} ${e.txHash ?? ''}`.trim()).join('; ')}). ` +
+          'Launch baru diblokir sampai jelas; periksa di explorer atau kirim /dismiss ya ke bot.',
+      );
+    }
+  } catch (err) {
+    fail(`Riwayat launch tidak bisa dibaca: ${short(err)}. Bot menolak launch kalau riwayatnya tidak terbaca.`);
+  }
 
   // 2. RPC + balances
   const checks = await deps.wallet.verifyChains();

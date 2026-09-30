@@ -82,8 +82,9 @@ Tidak ada port yang perlu dibuka (bot hanya melakukan koneksi keluar).
 Tidak tahu Telegram ID-mu? Kirim pesan ke `@userinfobot`. Atau isi sembarang angka (mis. `1`), jalankan bot, kirim `/id`
 ke bot, lalu ganti `ALLOWED_USER_IDS` di `.env` dan restart.
 
-Saat pembaruan, service dihentikan dulu supaya build tidak berbenturan dengan proses yang berjalan. Jangan memperbarui
-saat sebuah launch sedang berlangsung.
+Saat pembaruan, service dihentikan dulu supaya build tidak berbenturan dengan proses yang berjalan. Kalau sebuah launch
+sedang berlangsung, bot menyelesaikannya (dan mengirim pesan hasilnya) sebelum berhenti, jadi penghentian bisa memakan
+beberapa menit; jangan dipaksa mati.
 
 ### Manual (PC atau HP dengan Termux)
 
@@ -168,17 +169,30 @@ Kalau dev buy gagal, launch-nya tetap sukses dan bot memberitahumu.
   - chain benar dan pengirim adalah wallet bot; maksimal 4 langkah, hanya langkah terakhir yang boleh berupa panggilan;
   - panggilan hanya boleh ke kontrak yang tepat untuk langkahnya: *factory* untuk launch, *router* untuk swap. Permit2,
     escrow, hook, dan kontrak lain tidak pernah boleh dipanggil;
-  - token ERC-20 (pair atau token fee) hanya menerima `approve`, ke spender yang dikenal, dengan jumlah tidak lebih dari
-    fee/dev buy yang kamu setujui (Permit2 satu-satunya yang boleh menerima allowance tak terbatas, karena hanya bisa
-    memakai apa yang diizinkan permit terpisah);
+  - token ERC-20 hanya menerima `approve`, ke spender yang dikenal, dengan batas **per token**: token fee hanya boleh
+    di-approve sebesar fee, pair hanya sebesar dev buy. Launch tidak pernah butuh approve pair, jadi itu ditolak.
+    Allowance tak terbatas hanya boleh untuk **Permit2 kanonis** (`0x000000000022D473030F116dDEE9F6B43aC78BA3`), yang tidak
+    bisa memindahkan apa pun tanpa permit bertanda tangan yang juga dibatasi. Alamat "Permit2" yang hanya diklaim `/config`
+    tidak dipercaya, kecuali kamu mendaftarkannya sendiri di `EXTRA_ALLOWED_TARGETS` (untuk chain dengan Permit2
+    non-kanonis);
   - total `value` semua langkah tidak melebihi fee (atau jumlah dev buy) yang kamu setujui di Review;
-  - tanda tangan Permit2 hanya untuk pair yang dipilih, router sebagai spender, jumlah tidak melebihi dev buy, allowance
-    maksimal 31 hari dan tanda tangan maksimal 24 jam.
+  - tanda tangan Permit2: hanya untuk pair yang dipilih, router sebagai spender, jumlah tidak melebihi dev buy, allowance
+    maksimal 31 hari dan tanda tangan maksimal 24 jam. Yang ditandatangani adalah pesan yang **disusun ulang bot dari
+    field yang sudah divalidasi** (bukan objek dari API), jadi pemeriksa dan penanda tangan tidak bisa berbeda tafsir.
 
-  Kontrak dikenali dari `/config` o1 untuk chain yang dipilih. Pemeriksaan ini **tidak bisa dimatikan**; kontrak tambahan
-  yang sudah kamu verifikasi sendiri bisa didaftarkan di `EXTRA_ALLOWED_TARGETS` (kosong secara bawaan).
+  Kontrak tujuan (factory, router) diambil dari `/config` o1 untuk chain yang dipilih. **Alamatnya ditampilkan di Review**
+  supaya bisa kamu cocokkan dengan alamat resmi o1, dan launch dibatalkan kalau alamat itu berubah sesudah Review.
+  Pemeriksaan ini **tidak bisa dimatikan**; kontrak tambahan yang sudah kamu verifikasi sendiri bisa didaftarkan di
+  `EXTRA_ALLOWED_TARGETS` (kosong secara bawaan).
 - **Review terikat ke drafnya.** Konfirmasi hanya berlaku untuk draf yang persis sama dengan yang di-review; kalau ada yang
   diubah sesudahnya, kamu diminta Review ulang. Setiap upaya launch (sukses atau gagal) juga butuh Review baru.
+- **Satu draf = satu launch.** Draf yang launch-nya sudah terkirim atau berhasil tidak bisa diluncurkan lagi (akan
+  membuat token kembar), termasuk kalau konfirmasinya baru datang belakangan setelah bot melaporkan "belum jelas".
+  Draf baru (`/launch` › Reset draft, atau **Launch lagi**) selalu boleh: itu keputusanmu.
+- **Wallet harus bebas transaksi tertunda.** Launch ditolak selama wallet bot masih punya transaksi yang belum
+  terkonfirmasi di jaringan itu (nonce), supaya dua launch tidak bisa saling menyusul.
+- **Biaya gas dibatasi.** Kalau RPC memberi harga gas yang tidak masuk akal (batas per chain, mis. 0,01 ETH di Base),
+  transaksi tidak ditandatangani.
 - **Fee dijaga.** Jika fee launch (jumlah *atau* mata uangnya) berubah naik sesudah Review, launch dibatalkan.
 - **Rencana kedaluwarsa tidak ditandatangani.** Umur rencana dihitung dari cap waktu API (bukan jam server-mu); rencana
   yang tinggal beberapa detik disiapkan ulang, dan rencana tanpa waktu kedaluwarsa yang valid ditolak.
@@ -188,11 +202,17 @@ Kalau dev buy gagal, launch-nya tetap sukses dan bot memberitahumu.
 - **Log dan pesan bersih.** Private key, API key, token bot, dan kunci di dalam URL RPC disensor dari log **dan** dari
   pesan error yang dikirim ke Telegram. Hash transaksi tetap terlihat.
 - **Tidak ada resend buta, tidak ada dobel.** Transaksi ditandatangani lebih dulu, hash-nya **ditulis ke
-  `data/launches.jsonl` sebelum dikirim** (kalau tidak bisa ditulis, transaksi tidak dikirim), lalu dikirim tepat satu kali
-  tanpa retry tersembunyi. Kalau jawaban node hilang, bot mencari hash itu di chain dan tidak pernah mengirim ulang.
+  `data/launches.jsonl` dan di-fsync sebelum dikirim** (kalau tidak bisa ditulis atau dibaca, transaksi tidak dikirim),
+  lalu dikirim tepat satu kali tanpa retry tersembunyi. Jawaban node hanya dianggap "ditolak" bila teksnya membuktikan
+  transaksi tidak masuk (mis. `nonce too low`, `insufficient funds`); error lain (`internal error`, timeout, node sibuk)
+  bisa saja dikirim untuk transaksi yang tetap diterima, jadi bot mencari hash itu di chain dan tidak pernah mengirim
+  ulang. Receipt dari transaksi lain dengan nonce sama (dibatalkan/dipercepat dari aplikasi lain) tidak dianggap sebagai
+  konfirmasi.
 - **Launch tertunda memblokir launch baru** sampai jelas hasilnya (lihat di bawah).
-- **Berhenti dengan rapi.** Saat service dihentikan (`systemctl stop/restart`), bot berhenti menerima perintah baru,
-  menunggu launch yang sedang berjalan sampai selesai (maks 2 menit), dan mengirim pesan hasilnya sebelum keluar.
+- **Berhenti dengan rapi.** Saat service dihentikan (`systemctl stop/restart`) atau Telegram menolak polling (mis. ada
+  instance lain dengan token yang sama), bot berhenti menerima perintah baru, menunggu launch yang sedang berjalan sampai
+  selesai (maks 4 menit), dan mengirim pesan hasilnya sebelum keluar. Kalau jaringan mati saat boot, bot menunggu (sekitar
+  2 menit) alih-alih crash berulang.
 - Jika API key atau token bot bocor: cabut/buat ulang dari sumbernya. Jika private key bocor: pindahkan dana segera.
 
 ### Launch tertunda
@@ -202,9 +222,10 @@ tengah jalan), bot **memblokir launch baru** supaya tidak terjadi launch dobel, 
 menyala kembali). Yang perlu kamu lakukan:
 
 1. Buka hash transaksinya di explorer (ada di pesan bot dan di `/dismiss`).
-2. Kalau **berhasil**, tidak perlu apa-apa: bot menyelesaikannya sendiri begitu chain melaporkannya.
+2. Kalau **berhasil**, tidak perlu apa-apa: bot memeriksa tiap menit dan **mengirim pesan** begitu chain melaporkannya
+   (berhasil, revert, atau gugur). Draf itu lalu ditandai selesai dan tidak bisa diluncurkan lagi.
 3. Kalau **tidak akan pernah terkonfirmasi** (hilang dari mempool), kirim `/dismiss ya`. Transaksi yang tidak dikenal chain
-   selama 30 menit juga dianggap gugur otomatis.
+   selama 30 menit dianggap gugur otomatis, tetapi hanya kalau wallet bot tidak punya transaksi tertunda di mempool.
 
 Jangan gunakan `/dismiss ya` kalau transaksinya mungkin masih akan masuk: itu bisa menyebabkan launch dobel.
 
@@ -221,7 +242,9 @@ atau `1.0000` (desimal).
   bisa membaca parameter token di dalam calldata `createLaunch` (nama, tax, penerima fee): itu dibuat API o1 dari
   permintaanmu. Setelah launch, cek tokennya di explorer / launch.o1.exchange, terutama untuk launch pertama.
 - **Dev buy dibatasi** ke jumlah yang kamu setujui: allowance/permit yang diminta API lebih besar dari itu (mis. allowance
-  Permit2 lebih dari 31 hari) ditolak, dan dev buy-nya dilaporkan gagal (launch-nya tetap sukses).
+  Permit2 lebih dari 31 hari, atau approve tak terbatas ke router) ditolak, dan dev buy-nya dilaporkan gagal (launch-nya
+  tetap sukses). Kalau hasil dev buy tidak jelas (swap terkirim tapi belum terkonfirmasi), bot **tidak** menyuruhmu membeli
+  manual sebelum kamu mengecek hash-nya, supaya tidak beli dobel.
 - **Tanpa atomic dev buy** (lihat di atas) dan tanpa klaim fee di bot (klaim lewat web o1).
 - Supply tetap 1 miliar token dan likuiditas terkunci permanen; itu aturan kontrak o1, bukan bot.
 
@@ -236,6 +259,11 @@ atau `1.0000` (desimal).
 | `Pair … tidak tersedia` | Registrasi pair berubah di sisi o1; pilih pair lain. |
 | `Transaksi … ditolak demi keamanan` | Respons API tidak cocok dengan konfigurasi o1 (mis. kontrak tak dikenal, approve terlalu besar). Jangan dilewati begitu saja. Hanya bila kamu sudah memverifikasi sendiri kontraknya, daftarkan di `EXTRA_ALLOWED_TARGETS`. |
 | `Ada launch sebelumnya yang hasilnya belum jelas` | Lihat [Launch tertunda](#launch-tertunda). |
+| `Draft ini sudah berhasil di-launch` | Draf itu sudah dipakai; buat draf baru lewat `/launch` › Reset draft. |
+| `Alamat kontrak o1 berubah sejak Review` | Konfigurasi o1 berubah setelah Review. Buka Review lagi, cocokkan alamatnya, lalu konfirmasi. |
+| `Wallet bot masih punya N transaksi yang belum terkonfirmasi` | Tunggu sampai transaksi itu masuk (atau bereskan di explorer / aplikasi wallet), lalu coba lagi. |
+| `Biaya gas maksimum … melebihi batas keamanan` | RPC atau jaringan memberi harga gas tak wajar; tidak ada yang dikirim. Coba lagi nanti atau ganti RPC. |
+| `Riwayat launch tidak bisa dibaca` / `Folder data … tidak bisa ditulis` | Periksa izin folder `DATA_DIR` (di VPS: `/opt/o1launchtele/data`, milik user `o1bot`). Tanpa catatan riwayat bot menolak mengirim transaksi. |
 | `Draft berubah sejak Review` | Ada yang diubah setelah Review. Buka Review lagi lalu konfirmasi. |
 | `… harus URL https://` | Semua URL harus `https://` (atau `http://localhost`). Perbaiki di `.env`. |
 | `STRICT_TARGETS sudah dihapus` | Opsi untuk mematikan pemeriksaan target sudah dihapus (selalu aktif). Hapus barisnya dari `.env`. |
@@ -271,7 +299,7 @@ test/                 # unit + alur bot + end-to-end proses nyata (lihat di bawa
 ### Status pengujian
 
 Lingkungan tempat bot ini dibangun **tidak punya akses ke Telegram, API o1, maupun jaringan blockchain**, jadi bot
-**belum pernah dijalankan ke layanan sungguhan**. Yang sudah diuji (`npm test`, 200+ test):
+**belum pernah dijalankan ke layanan sungguhan**. Yang sudah diuji (`npm test`, 450+ test):
 
 - Perhitungan tax dicocokkan dengan angka resmi di dokumentasi o1 (mis. 3% dengan split 60/40 → protocol 0,5%,
   creator 1,5%, dividen 1%).
@@ -279,8 +307,12 @@ Lingkungan tempat bot ini dibangun **tidak punya akses ke Telegram, API o1, maup
 - Klien HTTP (retry, `Retry-After`, `Idempotency-Key`, problem+json), guard keamanan, launcher (revert, timeout, plan
   kedaluwarsa, approval, semua varian dev buy), dan wallet terhadap **server JSON-RPC tiruan** (transaksi yang ditandatangani
   dibaca kembali dan dicocokkan byte demi byte).
-- Seluruh alur Telegram dengan update palsu, serta satu tes **end-to-end** yang menjalankan proses bot sungguhan
-  melawan server tiruan Telegram, API o1, dan RPC.
+- Skenario serangan dan kegagalan dari **dua review keamanan independen**: plan/quote/`/config` yang jahat, balasan node
+  yang hilang atau berupa error padahal transaksi diterima, transaksi yang digantikan, konfirmasi yang datang terlambat,
+  crash di tengah launch, dan riwayat yang rusak. Uji mutasi memastikan tes gagal bila salah satu pengaman dihapus.
+- Seluruh alur Telegram dengan update palsu, serta beberapa tes **end-to-end** yang menjalankan proses bot sungguhan
+  melawan server tiruan Telegram, API o1, dan RPC (launch penuh, berhenti dengan rapi di tengah launch, konflik 409
+  Telegram, pemulihan setelah crash).
 
 Yang **belum** terverifikasi: perilaku API o1 asli (terutama bentuk respons swap untuk dev buy), Telegram asli, dan
 eksekusi on-chain nyata. **Untuk launch pertama**, mulai dari chain dengan biaya kecil dan dana secukupnya, dan periksa

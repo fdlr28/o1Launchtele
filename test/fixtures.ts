@@ -15,7 +15,8 @@ export const RECIPIENT = addr(0x3333);
 export const FACTORY = addr(0x2000);
 export const HOOK = addr(0x2001);
 export const ROUTER = addr(0x2002);
-export const PERMIT2 = addr(0x2003);
+/** The canonical Permit2 deployment (the guard trusts this address, not whatever /config says). */
+export const PERMIT2: Address = '0x000000000022D473030F116dDEE9F6B43aC78BA3';
 export const PROTOCOL = addr(0x4444);
 export const USDC = addr(0x5555);
 export const AAPL = addr(0x6666);

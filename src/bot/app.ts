@@ -6,6 +6,9 @@ import { registerInputs } from './inputs.js';
 import { Ui, type BotDeps } from './panel.js';
 import { StateStore, type BotContext } from './state.js';
 
+/** A stranger is told once per minute at most. */
+const STRANGER_COOLDOWN_MS = 60_000;
+
 export interface CreatedBot {
   bot: Bot<BotContext>;
   store: StateStore;
@@ -22,6 +25,9 @@ export function createBot(deps: BotDeps, telegramToken: string, options: Partial
   const store = new StateStore();
   const ui = new Ui(deps);
   const allowed = deps.config.allowedUserIds;
+  // Updates are handled one at a time, so a stranger who floods the bot must not get an awaited reply each
+  // (Telegram flood waits would queue the owner's own taps behind them): one quiet reply per minute, not awaited.
+  const strangerSeen = new Map<number, number>();
 
   bot.command('id', (ctx) => ctx.reply(`ID Telegram kamu: <code>${ctx.from?.id ?? '?'}</code>`, { parse_mode: 'HTML' }));
 
@@ -32,11 +38,18 @@ export function createBot(deps: BotDeps, telegramToken: string, options: Partial
       ctx.state = store.get(userId);
       return next();
     }
+    const now = Date.now();
+    const last = userId === undefined ? undefined : strangerSeen.get(userId);
+    if (last !== undefined && now - last < STRANGER_COOLDOWN_MS) return; // already told, already logged
+    if (userId !== undefined) {
+      strangerSeen.set(userId, now);
+      if (strangerSeen.size > 1000) for (const [id, at] of strangerSeen) if (now - at >= STRANGER_COOLDOWN_MS) strangerSeen.delete(id);
+    }
     deps.log.warn(`rejected update from unauthorised user ${userId ?? '?'}`);
     if (ctx.callbackQuery) {
-      await ctx.answerCallbackQuery({ text: 'Akses ditolak.', show_alert: true }).catch(() => {});
+      void ctx.answerCallbackQuery({ text: 'Akses ditolak.', show_alert: true }).catch(() => {});
     } else if (ctx.message) {
-      await ctx.reply(`⛔ Akses ditolak. ID Telegram kamu: ${userId ?? '?'}.\nMinta pemilik bot menambahkannya ke ALLOWED_USER_IDS.`);
+      void ctx.reply(`⛔ Akses ditolak. ID Telegram kamu: ${userId ?? '?'}.\nMinta pemilik bot menambahkannya ke ALLOWED_USER_IDS.`).catch(() => {});
     }
   });
 

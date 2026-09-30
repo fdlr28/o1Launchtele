@@ -16,6 +16,9 @@ const ORDER: Record<LogLevel, number> = { debug: 10, info: 20, warn: 30, error: 
 const PATTERNS: Array<[RegExp, string]> = [
   [/o1_launch_[0-9a-f]{8}_[A-Za-z0-9_-]+/g, 'o1_launch_***'],
   [/(?<![0-9])\d{5,}:[A-Za-z0-9_-]{30,}/g, '<telegram-bot-token>'],
+  // credentials in ANY url, whether or not it is one we know: userinfo, and secret-looking query parameters
+  [/(\bhttps?:\/\/)[^\s/@:]+:[^\s/@]+@/gi, '$1<redacted>@'],
+  [/([?&](?:api[-_]?key|key|token|access[-_]?token|auth|secret|password|signature)=)[^&\s"'<>]+/gi, '$1<redacted>'],
 ];
 
 /**
@@ -50,8 +53,11 @@ export function urlSecrets(value: string): string[] {
   const carriesCredential = url.username !== '' || url.password !== '' || url.search !== '' || url.pathname.length > 1;
   if (!carriesCredential) return [];
   const parts = new Set<string>([value, url.href, url.username, url.password]);
-  for (const segment of url.pathname.split('/')) if (segment.length >= 12) parts.add(segment);
-  for (const [, v] of url.searchParams) if (v.length >= 8) parts.add(v);
+  // The path and the query as wholes (a short key inside a longer string is still caught) and their pieces.
+  if (url.pathname.length > 1) parts.add(url.pathname);
+  if (url.search.length > 1) parts.add(url.search).add(url.search.slice(1));
+  for (const segment of url.pathname.split('/')) if (segment.length >= 8) parts.add(segment);
+  for (const [, v] of url.searchParams) if (v.length >= 4) parts.add(v);
   return [...parts].filter(Boolean);
 }
 

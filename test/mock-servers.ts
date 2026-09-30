@@ -47,6 +47,8 @@ export class MockTelegram {
   private updateId = 1;
   private messageId = 1;
   lastPanelId = 0;
+  /** Answer getUpdates with this Telegram error (409: another instance polls the same token). */
+  getUpdatesFault: { code: number; description: string } | null = null;
 
   async start() {
     this.server = createServer(async (req, res) => {
@@ -63,6 +65,7 @@ export class MockTelegram {
 
       if (method === 'getUpdates') {
         this.polls++;
+        if (this.getUpdatesFault) return json(res, this.getUpdatesFault.code, { ok: false, error_code: this.getUpdatesFault.code, description: this.getUpdatesFault.description });
         const offset = Number(payload.offset ?? 0);
         const pick = () => this.queue.filter((u) => (u as { update_id: number }).update_id >= offset);
         if (pick().length === 0) {

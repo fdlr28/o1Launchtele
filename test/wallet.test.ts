@@ -123,6 +123,84 @@ describe('sign then broadcast', () => {
   });
 });
 
+describe('what counts as a refusal (round-2 review)', () => {
+  const definite = [
+    [-32000, 'nonce too low: next nonce 6, tx nonce 5'],
+    [-32000, 'replacement transaction underpriced'],
+    [-32000, 'transaction underpriced'],
+    [-32000, 'insufficient funds for gas * price + value: address 0x1 have 1 want 2'],
+    [-32000, 'intrinsic gas too low: have 20000, want 53000'],
+    [-32000, 'exceeds block gas limit'],
+    [-32000, 'max fee per gas less than block base fee: maxFeePerGas: 1, baseFee: 2'],
+    [-32003, 'Insufficient funds for gas * price + value'],
+    [-32000, 'invalid sender'],
+    [-32000, 'oversized data'],
+  ] as const;
+  const uncertain = [
+    [-32603, 'internal error'],
+    [-32000, 'timeout'],
+    [-32000, 'context deadline exceeded'],
+    [-32005, 'rate limit exceeded'],
+    [-32000, 'header not found'],
+    [-32000, 'server busy'],
+    [-32001, 'resource not found'],
+    [-32000, 'something new that no list has heard of'],
+  ] as const;
+
+  it.each(definite)('%i "%s" proves the node did not take the transaction', async (code, message) => {
+    rpc.failNextSend = { code, message };
+    const signed = await wallet.sign(8453, TX);
+    const err = await wallet.broadcast(8453, signed).catch((e) => e);
+    expect(err).toBeInstanceOf(BroadcastRejectedError);
+    expect(err.message).toContain(message.split(':')[0]!.slice(0, 20)); // the node's own words reach the owner
+  });
+
+  it.each(uncertain)('%i "%s" may be an answer for a transaction that WAS taken: uncertain', async (code, message) => {
+    rpc.failNextSend = { code, message };
+    rpc.failNextSendStillAccepts = true;
+    const signed = await wallet.sign(8453, TX);
+    const err = await wallet.broadcast(8453, signed).catch((e) => e);
+    expect(err).toBeInstanceOf(BroadcastUncertainError);
+    expect(err).not.toBeInstanceOf(BroadcastRejectedError);
+    expect(rpc.received).toHaveLength(1); // ... and it really was taken
+    expect(await wallet.transactionStatus(8453, signed.hash)).not.toBe('unknown');
+  });
+
+  it('never puts the RPC URL (which may carry a key) into the reason', async () => {
+    rpc.failNextSend = { code: -32603, message: 'internal error' };
+    const signed = await wallet.sign(8453, TX);
+    const err = await wallet.broadcast(8453, signed).catch((e) => e);
+    expect(err.message).not.toContain(rpc.url);
+    expect(err.message).not.toContain('Request body');
+  });
+});
+
+describe('gas cost is capped (round-2 review)', () => {
+  it('refuses to sign when the RPC quotes a fee that could burn the wallet, and says so', async () => {
+    rpc.priorityFee = 500_000_000_000; // 500 gwei
+    const err = await wallet.sign(8453, TX).catch((e) => e);
+    expect(err).toBeInstanceOf(UserFacingError);
+    expect(err.message).toMatch(/Biaya gas maksimum 0\.0\d+ ETH melebihi batas keamanan 0\.01 ETH/);
+    expect(rpc.received).toHaveLength(0);
+  });
+
+  it('signs at ordinary fees, also on a busy chain', async () => {
+    rpc.priorityFee = 50_000_000_000; // 50 gwei: 115k gas x ~51 gwei = 0.006 ETH, under the 0.01 ETH cap
+    await expect(wallet.sign(8453, TX)).resolves.toBeDefined();
+  });
+});
+
+describe('what waits in the mempool', () => {
+  it('counts pending transactions of the wallet: pending nonce minus confirmed nonce', async () => {
+    expect(await wallet.pendingTransactionCount(8453)).toBe(0);
+    rpc.autoMine = false;
+    await wallet.broadcast(8453, await wallet.sign(8453, TX));
+    expect(await wallet.pendingTransactionCount(8453)).toBe(1);
+    rpc.mine();
+    expect(await wallet.pendingTransactionCount(8453)).toBe(0);
+  });
+});
+
 describe('transaction status and receipts', () => {
   it('reports pending, success, reverted and unknown', async () => {
     rpc.autoMine = false;
@@ -144,7 +222,7 @@ describe('transaction status and receipts', () => {
   it('waits for a receipt and reports success or revert', async () => {
     const ok = await wallet.sign(8453, { ...TX, data: '0x01' });
     await wallet.broadcast(8453, ok);
-    expect(await wallet.waitForReceipt(8453, ok.hash, 10_000)).toMatchObject({ status: 'success' });
+    expect(await wallet.waitForReceipt(8453, ok.hash, 10_000)).toMatchObject({ status: 'success', transactionHash: ok.hash });
 
     rpc.revertNext = true;
     const bad = await wallet.sign(8453, { ...TX, data: '0x02' });

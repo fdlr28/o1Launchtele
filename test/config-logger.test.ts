@@ -97,6 +97,16 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ ...valid, STRICT_TARGETS: 'TRUE' })).not.toThrow();
   });
 
+  it('never echoes a long value in an error: a secret may have been pasted into the wrong variable', () => {
+    const pasted = `0x${'ab'.repeat(32)}`;
+    for (const name of ['ALLOWED_USER_IDS', 'EXTRA_ALLOWED_TARGETS', 'ENABLED_CHAINS']) {
+      const message = errorOf({ ...valid, [name]: pasted, ...(name === 'ENABLED_CHAINS' ? {} : {}) });
+      expect(message, name).not.toContain(pasted);
+      expect(message, name).toContain('karakter)');
+    }
+    expect(errorOf({ ...valid, ALLOWED_USER_IDS: 'abc' })).toContain('"abc"'); // short values stay readable
+  });
+
   it('reads EXTRA_ALLOWED_TARGETS as a list of addresses and rejects anything else', () => {
     const a = '0x1111111111111111111111111111111111111111';
     const b = '0xAbCdEf0123456789aBcDeF0123456789aBcDeF01';
@@ -158,6 +168,22 @@ describe('credential-bearing URLs', () => {
     } finally {
       setErrorSanitizer((text) => text);
     }
+  });
+
+  it('redacts credentials in ANY url, not only in the ones the config knows (round-2 review)', () => {
+    expect(redact('GET https://user:hunter2@rpc.example/x failed')).toBe('GET https://<redacted>@rpc.example/x failed');
+    expect(redact('https://rpc.example/v1?key=ab12&x=1')).toBe('https://rpc.example/v1?key=<redacted>&x=1');
+    expect(redact('https://rpc.example/?apikey=abc&Token=t0k3n&chain=8453')).toBe('https://rpc.example/?apikey=<redacted>&Token=<redacted>&chain=8453');
+    expect(redact('https://mainnet.base.org/ is fine')).toBe('https://mainnet.base.org/ is fine');
+  });
+
+  it('a short key inside a longer path or query of a configured RPC URL is caught as a whole', () => {
+    const short = 'https://rpc.example/v2/abc12345?tag=zz&auth=k9';
+    const parts = urlSecrets(short);
+    expect(parts).toEqual(expect.arrayContaining(['/v2/abc12345', '?tag=zz&auth=k9', 'abc12345']));
+    const out = redact(`error calling ${short} (path /v2/abc12345)`, parts);
+    expect(out).not.toContain('abc12345');
+    expect(out).not.toContain('k9');
   });
 
   it('collects every secret of a config: key with and without 0x, o1 key, bot token and RPC keys', () => {

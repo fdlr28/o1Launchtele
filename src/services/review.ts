@@ -7,7 +7,7 @@ import { isNativeQuote, type Catalog } from '../o1/catalog.js';
 import { draftProblems } from '../o1/launchRequest.js';
 import type { Wallet } from '../wallet/wallet.js';
 import { resolveLaunchContext, type LaunchContext } from './context.js';
-import { NO_FEE, PendingLaunchError, type Launcher, type ReviewedFee } from './launcher.js';
+import { DraftAlreadyLaunchedError, NO_FEE, PendingLaunchError, contractsOf, type Launcher, type ReviewedContracts, type ReviewedFee } from './launcher.js';
 
 /** One line of the funds check: what the wallet holds against what the launch needs. */
 export interface FundsLine {
@@ -26,13 +26,15 @@ export interface Review {
   taxPolicy: TaxPolicy | null;
   /** The creation fee the owner is about to accept; the launch aborts if the live fee is higher. */
   reviewedFee: ReviewedFee | null;
+  /** The o1 contracts that will receive the money; the launch aborts if they change after the review. */
+  contracts: ReviewedContracts | null;
   funds: FundsLine[];
 }
 
 export interface ReviewDeps {
   catalog: Catalog;
   wallet: Wallet;
-  launcher: Pick<Launcher, 'pendingLaunches'>;
+  launcher: Pick<Launcher, 'pendingLaunches' | 'priorLaunch'>;
 }
 
 export async function buildReview(deps: ReviewDeps, draft: Draft): Promise<Review> {
@@ -50,11 +52,18 @@ export async function buildReview(deps: ReviewDeps, draft: Draft): Promise<Revie
   }
   problems.push(...draftProblems(draft, ctx?.suite));
 
+  // The history is what prevents a second launch: if it cannot be read, or says this draft (or another launch)
+  // is already on its way, there is no green light.
   try {
     const pending = await deps.launcher.pendingLaunches();
-    if (pending.length > 0) problems.push(new PendingLaunchError(pending).message);
+    if (pending.length > 0) {
+      problems.push(new PendingLaunchError(pending).message);
+    } else {
+      const prior = await deps.launcher.priorLaunch(draft.id);
+      if (prior) problems.push(new DraftAlreadyLaunchedError(prior).message);
+    }
   } catch (err) {
-    warnings.push(`Riwayat launch tidak bisa diperiksa (${describeError(err).split('\n')[0]}).`);
+    problems.push(describeError(err));
   }
 
   const taxPolicy = ctx && draft.product === 'tax' ? readTaxPolicy(ctx.suite) : null;
@@ -110,5 +119,6 @@ export async function buildReview(deps: ReviewDeps, draft: Draft): Promise<Revie
   }
 
   const reviewedFee: ReviewedFee | null = ctx ? (ctx.fee ? { currency: ctx.fee.currency, amountRaw: ctx.fee.amountRaw } : NO_FEE) : null;
-  return { ok: problems.length === 0, problems, warnings, ctx, taxPolicy, reviewedFee, funds };
+  const contracts = ctx ? contractsOf(ctx.suite) : null;
+  return { ok: problems.length === 0, problems, warnings, ctx, taxPolicy, reviewedFee, contracts, funds };
 }

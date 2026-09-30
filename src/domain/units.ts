@@ -82,6 +82,8 @@ export function formatAmount(raw: bigint, decimals: number, maxFraction = 6): st
   const full = formatUnits(raw, decimals);
   const [whole = '0', frac = ''] = full.split('.');
   const trimmed = frac.slice(0, maxFraction).replace(/0+$/, '');
+  // A small but non-zero amount must not look like nothing: "<0.000001", not "0".
+  if (!trimmed && raw > 0n && whole === '0') return `<0.${'0'.repeat(Math.max(0, maxFraction - 1))}1`;
   return trimmed ? `${whole}.${trimmed}` : whole;
 }
 

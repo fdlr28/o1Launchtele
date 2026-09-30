@@ -4,6 +4,7 @@ import { ConfigError, configSecrets, loadConfig, type AppConfig } from './config
 import { runDoctor } from './doctor.js';
 import { redact } from './logger.js';
 import { O1Client } from './o1/client.js';
+import { History } from './services/history.js';
 import { ViemWallet } from './wallet/wallet.js';
 
 /** `npm run doctor`: checks the setup (.env, Telegram, RPC, wallet, o1 API) without sending anything. */
@@ -32,7 +33,7 @@ async function main(): Promise<void> {
   );
   const api = new O1Client({ baseUrl: config.o1ApiBaseUrl, apiKey: config.o1ApiKey });
 
-  const report = await runDoctor({ config, telegramGetMe: () => telegram.getMe(), wallet, api });
+  const report = await runDoctor({ config, history: new History(config.dataDir), telegramGetMe: () => telegram.getMe(), wallet, api });
   for (const line of report.lines) print(line);
   process.exit(report.ok ? 0 : 1);
 }

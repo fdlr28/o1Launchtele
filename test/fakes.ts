@@ -43,7 +43,8 @@ export function tempDir(): string {
   return mkdtempSync(join(tmpdir(), 'o1bot-test-'));
 }
 
-export type ReceiptBehavior = 'success' | 'reverted' | 'timeout';
+/** 'replaced': another transaction with the same nonce was mined instead of the one asked for. */
+export type ReceiptBehavior = 'success' | 'reverted' | 'timeout' | 'replaced';
 
 /**
  * How the fake network treats one broadcast:
@@ -77,6 +78,9 @@ export class FakeWallet implements Wallet {
   statuses = new Map<Hash, TxStatus>();
   /** Make transactionStatus throw (RPC down). */
   statusError = false;
+  /** Transactions of this wallet waiting in the mempool (pending nonce minus confirmed nonce). */
+  pendingCount = 0;
+  pendingCountError = false;
   statusCalls = 0;
   /** Called inside broadcast() before the network is involved; lets tests inspect what was durable by then. */
   onBroadcast?: (signed: SentTx) => void | Promise<void>;
@@ -129,10 +133,15 @@ export class FakeWallet implements Wallet {
     if (forced) return forced;
     return this.sent.some((s) => s.hash === hash) ? 'success' : 'unknown';
   }
-  async waitForReceipt(_chainId: number, _hash: Hash): Promise<Receipt> {
+  async waitForReceipt(_chainId: number, hash: Hash): Promise<Receipt> {
     const behavior = this.receipts.shift() ?? 'success';
     if (behavior === 'timeout') throw new Error('Timed out while waiting for transaction');
-    return { status: behavior, blockNumber: 500n + BigInt(this.sent.length), gasUsed: 21_000n };
+    const transactionHash = behavior === 'replaced' ? (`0x${'ee'.repeat(32)}` as Hash) : hash;
+    return { status: behavior === 'reverted' ? 'reverted' : 'success', transactionHash, blockNumber: 500n + BigInt(this.sent.length), gasUsed: 21_000n };
+  }
+  async pendingTransactionCount(): Promise<number> {
+    if (this.pendingCountError) throw new Error('RPC unreachable');
+    return this.pendingCount;
   }
   async hasCode() {
     this.codeCalls++;

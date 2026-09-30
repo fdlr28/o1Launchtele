@@ -1,5 +1,5 @@
 import { InlineKeyboard } from 'grammy';
-import { TxError, describeError } from '../errors.js';
+import { TxError, TxUnknownError, describeError } from '../errors.js';
 import type { LaunchJob, LaunchOutcome, ProgressEvent } from '../services/launcher.js';
 import { failureKeyboard, resultKeyboard } from './keyboards.js';
 import type { BotDeps, Target, Ui } from './panel.js';
@@ -18,7 +18,7 @@ export async function startLaunch(target: Target, deps: BotDeps, ui: Ui): Promis
   const reviewed = state.reviewed;
   if (!draft || !reviewed) return;
 
-  const job: LaunchJob = { draft: structuredClone(draft), reviewedFee: reviewed.fee };
+  const job: LaunchJob = { draft: structuredClone(draft), reviewedFee: reviewed.fee, reviewedContracts: reviewed.contracts };
   const explorer = ui.explorer(draft.chainId);
   const events: ProgressEvent[] = [];
 
@@ -77,7 +77,8 @@ export async function startLaunch(target: Target, deps: BotDeps, ui: Ui): Promis
       } else {
         deps.log.error('launch failed', failure);
         const txHash = failure instanceof TxError ? failure.txHash : undefined;
-        await ui.upsert(target, { text: failureText(describeError(failure), txHash, explorer), keyboard: failureKeyboard() });
+        const unknown = failure instanceof TxUnknownError;
+        await ui.upsert(target, { text: failureText(describeError(failure), txHash, explorer, { unknown }), keyboard: failureKeyboard() });
       }
     } catch (err) {
       // The launch itself is already settled; only reporting failed. Make sure the user still learns the outcome.

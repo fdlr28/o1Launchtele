@@ -103,6 +103,8 @@ export function createHarness() {
       errors.push((err as BotError).error ?? err);
       await bot.errorHandler(err as BotError<BotContext>);
     }
+    // replies that the bot deliberately does not await (to strangers) still have to reach the fake API
+    await new Promise((resolve) => setImmediate(resolve));
   };
 
   let updateId = 1;

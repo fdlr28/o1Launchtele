@@ -153,7 +153,7 @@ describe('end to end (real process, local mock Telegram / o1 API / EVM node)', (
     expect(tg.panelText()).toContain(sent.hash.slice(0, 6));
 
     // --- durable record written before waiting for the receipt ---
-    const lines = readFileSync(join(dataDir, 'launches.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    const lines = readFileSync(join(dataDir, 'launches.jsonl'), 'utf8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
     expect(lines.map((l) => l.status)).toEqual(['sent', 'confirmed']);
     expect(lines[0]).toMatchObject({ txHash: sent.hash, token: TOKEN, symbol: 'PEPE', chainId: 8453 });
   }, 90_000);
@@ -321,7 +321,7 @@ describe('end to end: shutdown and crash recovery (real process)', () => {
 
     // the launch was completed on chain ...
     expect(rpc.received).toHaveLength(1);
-    const lines = readFileSync(join(stack.dataDir, 'launches.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    const lines = readFileSync(join(stack.dataDir, 'launches.jsonl'), 'utf8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
     expect(lines.map((l) => l.status)).toEqual(['sent', 'confirmed']);
     // ... and the user was told, even though the process was already shutting down
     expect(tg.panelText()).toContain('Launch berhasil');
@@ -355,6 +355,28 @@ describe('end to end: shutdown and crash recovery (real process)', () => {
 
     tg.press('nav:review');
     await until(() => tg.panelText().includes('Semua cek lolos'), 'review passes again');
+  }, 90_000);
+
+  it('a Telegram 409 (another instance polls the same token) does not cut a running launch: it finishes, then the bot leaves with an error code', async () => {
+    stack = await boot();
+    const { tg, o1, rpc, until, exited } = stack;
+    rpc.autoMine = false; // the launch is pending until we mine it
+    await stack.fillAndReview();
+    tg.press('go:launch');
+    await until(() => rpc.received.length === 1, 'launch broadcast');
+
+    tg.getUpdatesFault = { code: 409, description: 'Conflict: terminated by other getUpdates request; make sure that only one bot instance is running' };
+    const early = await Promise.race([exited, new Promise<'alive'>((resolve) => setTimeout(() => resolve('alive'), 2_500))]);
+    expect(early, 'the bot must wait for the pending launch instead of exiting on the 409').toBe('alive');
+    expect(stack.output()).toContain('error Telegram: berhenti menerima perintah baru');
+
+    rpc.mine(); // the launch confirms
+    const code = await Promise.race([exited, new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 30_000))]);
+    expect(code).toBe(1); // still an error exit, so systemd restarts it
+    expect(o1.bodies).toHaveLength(1);
+    const lines = readFileSync(join(stack.dataDir, 'launches.jsonl'), 'utf8').split('\n').filter((l) => l.trim()).map((l) => JSON.parse(l));
+    expect(lines.map((l) => l.status)).toEqual(['sent', 'confirmed']);
+    expect(tg.panelText()).toContain('Launch berhasil');
   }, 90_000);
 
   it('refuses to start with a plain-http o1 API URL, naming the problem and leaking nothing', async () => {

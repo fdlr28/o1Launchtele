@@ -135,8 +135,9 @@ describe('setup-vps.sh: functions', () => {
       'PrivateTmp=true',
       'UMask=0077',
       'StartLimitBurst=5',
-      // The bot waits up to 120 s for a running launch on SIGTERM; systemd must not kill it sooner.
-      'TimeoutStopSec=150',
+      // The bot waits up to 240 s for a running launch on SIGTERM, then up to 15 s to report it; systemd must not
+      // kill it sooner (src/index.ts: SHUTDOWN_DRAIN_MS + SHUTDOWN_REPORT_MS).
+      'TimeoutStopSec=270',
       'WantedBy=multi-user.target',
     ]) expect(text, line).toContain(line);
     expect(text).toMatch(/ExecStart=\/\S*node dist\/index\.js/);
@@ -160,6 +161,15 @@ describe('setup-vps.sh: functions', () => {
       writeFileSync(broken, text.replace('Restart=on-failure', 'Restart=sometimes'));
       expect(verify(broken)?.join('\n')).toMatch(/restart/i);
     }
+  });
+
+  it('gives systemd a stop timeout longer than the bot needs to drain a launch and report it', () => {
+    const constant = (name: string) => Number(new RegExp(`${name} = ([\\d_]+)`).exec(readFileSync(join(import.meta.dirname, '..', 'src/index.ts'), 'utf8'))?.[1]?.replaceAll('_', ''));
+    const drainAndReport = (constant('SHUTDOWN_DRAIN_MS') + constant('SHUTDOWN_REPORT_MS')) / 1000;
+    expect(drainAndReport).toBeGreaterThan(100); // the constants were really found
+    const unit = sh('render_unit', { O1_SERVICE_USER: 'root', O1_APP_DIR: '/srv/o1bot' });
+    const timeout = Number(/TimeoutStopSec=(\d+)/.exec(unit.out)?.[1]);
+    expect(timeout).toBeGreaterThanOrEqual(drainAndReport + 5);
   });
 
   it('writes .env with mode 600, no leftovers, and stripped user ids', () => {

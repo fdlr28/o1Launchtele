@@ -7,7 +7,15 @@ export interface ChainInfo {
   defaultRpc?: string;
   /** Block explorer base URL (no trailing slash), used for tx links. */
   explorer?: string;
+  /**
+   * Most a single transaction may cost in gas (gas limit x max fee per gas, in wei). Generous compared with a
+   * launch (tens of times), but far below what a broken or hostile RPC could make the wallet burn.
+   */
+  maxGasCostWei: bigint;
 }
+
+/** Applies to chains that are not in the table below. */
+export const DEFAULT_MAX_GAS_COST_WEI = 10n ** 18n;
 
 /**
  * Chains supported by the o1 Launchpad public API (docs.o1.exchange/launchpad/api/introduction).
@@ -23,6 +31,7 @@ export const CHAINS: Record<number, ChainInfo> = {
     nativeDecimals: 18,
     defaultRpc: 'https://mainnet.base.org',
     explorer: 'https://basescan.org',
+    maxGasCostWei: 10n ** 16n, // 0.01 ETH
   },
   4663: {
     id: 4663,
@@ -30,6 +39,7 @@ export const CHAINS: Record<number, ChainInfo> = {
     nativeSymbol: 'ETH',
     nativeDecimals: 18,
     explorer: 'https://rh-scan.com',
+    maxGasCostWei: 10n ** 16n, // 0.01 ETH
   },
   143: {
     id: 143,
@@ -37,12 +47,14 @@ export const CHAINS: Record<number, ChainInfo> = {
     nativeSymbol: 'MON',
     nativeDecimals: 18,
     defaultRpc: 'https://rpc.monad.xyz',
+    maxGasCostWei: 20n * 10n ** 18n, // 20 MON
   },
   5042: {
     id: 5042,
     name: 'Arc',
     nativeSymbol: 'USDC',
     nativeDecimals: 18,
+    maxGasCostWei: 2n * 10n ** 18n, // 2 USDC (Arc pays gas in USDC)
   },
   56: {
     id: 56,
@@ -51,6 +63,7 @@ export const CHAINS: Record<number, ChainInfo> = {
     nativeDecimals: 18,
     defaultRpc: 'https://bsc-dataseed.binance.org',
     explorer: 'https://bscscan.com',
+    maxGasCostWei: 5n * 10n ** 16n, // 0.05 BNB
   },
   196: {
     id: 196,
@@ -59,6 +72,7 @@ export const CHAINS: Record<number, ChainInfo> = {
     nativeDecimals: 18,
     defaultRpc: 'https://rpc.xlayer.tech',
     explorer: 'https://xlayerscan.com',
+    maxGasCostWei: 5n * 10n ** 17n, // 0.5 OKB
   },
 };
 

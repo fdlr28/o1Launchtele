@@ -45,6 +45,9 @@ function isSecureUrl(value: string): boolean {
 
 const SECURE_URL_HINT = 'harus URL https:// yang valid (http:// hanya boleh ke localhost)';
 
+/** A value quoted in an error message is shortened: a secret may have been pasted into the wrong variable. */
+const brief = (value: string): string => (value.length > 16 ? `${value.slice(0, 4)}…(${value.length} karakter)` : value);
+
 /** Reads and validates the environment. Every problem is reported at once. */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const errors: string[] = [];
@@ -66,7 +69,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const allowedUserIds = new Set<number>();
   const allowedRaw = required('ALLOWED_USER_IDS', 'ID Telegram numerik yang boleh memakai bot, pisahkan dengan koma');
   for (const part of allowedRaw.split(/[\s,]+/).filter(Boolean)) {
-    if (!/^\d{1,15}$/.test(part) || Number(part) <= 0) errors.push(`ALLOWED_USER_IDS berisi nilai yang bukan ID numerik: "${part}".`);
+    if (!/^\d{1,15}$/.test(part) || Number(part) <= 0) errors.push(`ALLOWED_USER_IDS berisi nilai yang bukan ID numerik: "${brief(part)}".`);
     else allowedUserIds.add(Number(part));
   }
 
@@ -103,7 +106,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     chainIds = [];
     for (const part of enabledRaw.split(/[\s,]+/).filter(Boolean)) {
       const id = Number(part);
-      if (!SUPPORTED_CHAIN_IDS.includes(id)) errors.push(`ENABLED_CHAINS berisi chain yang tidak didukung: "${part}" (didukung: ${SUPPORTED_CHAIN_IDS.join(', ')}).`);
+      if (!SUPPORTED_CHAIN_IDS.includes(id)) errors.push(`ENABLED_CHAINS berisi chain yang tidak didukung: "${brief(part)}" (didukung: ${SUPPORTED_CHAIN_IDS.join(', ')}).`);
       else if (!rpcUrls[id]) errors.push(`Chain ${id} diaktifkan tetapi RPC_URL_${id} belum diisi.`);
       else chainIds.push(id);
     }
@@ -123,7 +126,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const extraAllowedTargets: string[] = [];
   for (const part of (get('EXTRA_ALLOWED_TARGETS') ?? '').split(/[\s,]+/).filter(Boolean)) {
     if (isAddress(part, { strict: false })) extraAllowedTargets.push(part.toLowerCase());
-    else errors.push(`EXTRA_ALLOWED_TARGETS berisi alamat yang tidak valid: "${part}".`);
+    else errors.push(`EXTRA_ALLOWED_TARGETS berisi alamat yang tidak valid: "${brief(part)}".`);
   }
   // The old opt-out is gone. "true" is what the bot does anyway, so a leftover line is harmless; anything else
   // would be an owner expecting a check to be off that no longer can be, and must not pass silently.

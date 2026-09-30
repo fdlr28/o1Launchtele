@@ -7,7 +7,7 @@ import { TxRevertedError, TxUnknownError, UserFacingError, describeError } from 
 import { isNativeQuote, type Catalog } from '../o1/catalog.js';
 import { ApiError, type O1Api } from '../o1/client.js';
 import { buildLaunchRequest } from '../o1/launchRequest.js';
-import { coerceTypedData, extractTxSteps, extractTypedData, sameAddress, type ExtractedTx } from '../o1/swap.js';
+import { extractTxSteps, extractTypedData, sameAddress, type ExtractedTx } from '../o1/swap.js';
 import type { ContractSuite, LaunchPrepareResult, PlanIssue, SwapQuoteRequest } from '../o1/types.js';
 import type { Logger } from '../logger.js';
 import { BroadcastRejectedError, type Receipt, type TxStatus, type Wallet } from '../wallet/wallet.js';
@@ -45,15 +45,43 @@ export interface ReviewedFee {
 
 export const NO_FEE: ReviewedFee = { currency: zeroAddress, amountRaw: 0n };
 
+/**
+ * The o1 contracts that will receive the owner's money, as shown in the review. They come from the o1 API,
+ * so the owner gets to see them, and the launch aborts if they differ from what was reviewed.
+ */
+export interface ReviewedContracts {
+  factory: string;
+  swapRouter?: string;
+  universalRouter?: string;
+  permit2?: string;
+}
+
+export function contractsOf(suite: ContractSuite): ReviewedContracts {
+  const c = suite.contracts;
+  const low = (value?: string) => (value ? value.toLowerCase() : undefined);
+  return { factory: c.factory.toLowerCase(), swapRouter: low(c.swapx_router), universalRouter: low(c.universal_router), permit2: low(c.permit2) };
+}
+
+export function sameContracts(a: ReviewedContracts, b: ReviewedContracts): boolean {
+  return a.factory === b.factory && a.swapRouter === b.swapRouter && a.universalRouter === b.universalRouter && a.permit2 === b.permit2;
+}
+
 export interface LaunchJob {
   /** A snapshot: later edits of the live draft must not affect a running launch. */
   draft: Draft;
   reviewedFee: ReviewedFee;
+  reviewedContracts: ReviewedContracts;
 }
 
 export type DevBuyOutcome =
   | { status: 'done'; txHash: Hash; approvalTxs: Hash[] }
-  | { status: 'failed'; reason: string; txHash?: Hash };
+  | {
+      status: 'failed';
+      reason: string;
+      txHash?: Hash;
+      /** The swap was sent and may still land: the owner must not be told to buy by hand. */
+      unknown?: boolean;
+    };
 
 export interface LaunchOutcome {
   chainId: number;
@@ -72,6 +100,8 @@ export interface LauncherDeps {
   log: Logger;
   /** Contracts the owner explicitly trusts on top of those in /config (EXTRA_ALLOWED_TARGETS). */
   extraTargets?: readonly string[];
+  /** Called when a launch that was pending turns out to have confirmed, reverted or vanished. */
+  onSettled?: (entry: HistoryEntry, status: 'confirmed' | 'reverted' | 'failed') => void;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
 }
@@ -84,6 +114,18 @@ export class PendingLaunchError extends UserFacingError {
         'Periksa hash itu di explorer. Kalau transaksinya sudah pasti tidak akan terkonfirmasi, kirim "/dismiss ya" untuk mengabaikannya, lalu coba lagi.',
     );
     this.name = 'PendingLaunchError';
+  }
+}
+
+/** This draft already produced a launch that is sent or confirmed: launching it again would create a duplicate token. */
+export class DraftAlreadyLaunchedError extends UserFacingError {
+  constructor(public readonly entry: HistoryEntry) {
+    super(
+      entry.status === 'confirmed'
+        ? `Draft ini sudah berhasil di-launch (tx ${entry.txHash}${entry.token ? `, token ${entry.token}` : ''}). Meluncurkannya lagi akan membuat token kembar. Buat draft baru dengan /launch lalu Reset draft.`
+        : `Draft ini sudah punya transaksi launch yang belum jelas hasilnya (tx ${entry.txHash}). Tunggu sampai jelas; jangan meluncurkannya lagi.`,
+    );
+    this.name = 'DraftAlreadyLaunchedError';
   }
 }
 
@@ -111,6 +153,8 @@ export class Launcher {
   private busy = false;
   private accepting = true;
   private idleWaiters: Array<() => void> = [];
+  /** Settling the history is done one caller at a time: two at once would record (and announce) a result twice. */
+  private exclusiveChain: Promise<unknown> = Promise.resolve();
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly now: () => number;
 
@@ -144,9 +188,22 @@ export class Launcher {
    * Launches sent earlier whose outcome is still unknown. Those that have meanwhile confirmed, reverted or
    * clearly vanished are settled in the history on the way.
    */
-  async pendingLaunches(): Promise<HistoryEntry[]> {
+  pendingLaunches(): Promise<HistoryEntry[]> {
+    return this.exclusive(() => this.settlePending());
+  }
+
+  private exclusive<T>(job: () => Promise<T>): Promise<T> {
+    const result = this.exclusiveChain.then(job, job);
+    this.exclusiveChain = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  private async settlePending(): Promise<HistoryEntry[]> {
     const still: HistoryEntry[] = [];
-    for (const entry of await this.deps.history.pending()) {
+    for (const entry of await this.readHistory(() => this.deps.history.pending())) {
       const txHash = entry.txHash as Hash;
       let status: TxStatus;
       try {
@@ -155,23 +212,72 @@ export class Launcher {
         still.push(entry); // the RPC cannot tell us: stay blocked rather than risk a double launch
         continue;
       }
-      const base = { kind: 'launch' as const, chainId: entry.chainId, product: entry.product, name: entry.name, symbol: entry.symbol, token: entry.token, quote: entry.quote, txHash };
-      if (status === 'success') await this.record({ ...base, status: 'confirmed', note: 'settled later' });
-      else if (status === 'reverted') await this.record({ ...base, status: 'reverted', note: 'settled later' });
-      else if (status === 'unknown' && this.now() - Date.parse(entry.ts) > PENDING_GIVE_UP_MS) {
-        await this.record({ ...base, status: 'failed', note: 'not found on chain after 30 minutes' });
-      } else still.push(entry);
+      if (status === 'success') await this.settle(entry, 'confirmed', 'settled later');
+      else if (status === 'reverted') await this.settle(entry, 'reverted', 'settled later');
+      else if (status === 'unknown' && (await this.canGiveUp(entry))) await this.settle(entry, 'failed', 'not found on chain after 30 minutes');
+      else still.push(entry);
     }
     return still;
   }
 
-  /** The owner's explicit acknowledgement that the pending launches will never confirm. */
-  async dismissPending(): Promise<number> {
-    const pending = await this.deps.history.pending();
-    for (const entry of pending) {
-      await this.record({ kind: 'launch', chainId: entry.chainId, product: entry.product, name: entry.name, symbol: entry.symbol, token: entry.token, quote: entry.quote, txHash: entry.txHash, status: 'failed', note: 'dismissed by owner' });
+  /**
+   * A transaction the chain has never heard of may still be sitting in some node's pool, so time alone is not
+   * enough: the wallet must also have nothing waiting in the mempool (otherwise the next launch would take
+   * the following nonce and BOTH could be mined).
+   */
+  private async canGiveUp(entry: HistoryEntry): Promise<boolean> {
+    if (this.now() - Date.parse(entry.ts) <= PENDING_GIVE_UP_MS) return false;
+    try {
+      return (await this.deps.wallet.pendingTransactionCount(entry.chainId)) === 0;
+    } catch {
+      return false;
     }
-    return pending.length;
+  }
+
+  private async settle(entry: HistoryEntry, status: 'confirmed' | 'reverted' | 'failed', note: string): Promise<void> {
+    await this.record(historyBase(entry, status, note));
+    try {
+      this.deps.onSettled?.({ ...entry, status, note }, status);
+    } catch (err) {
+      this.deps.log.debug('onSettled callback failed', err);
+    }
+  }
+
+  /** The owner's explicit acknowledgement that the pending launches will never confirm. */
+  dismissPending(): Promise<number> {
+    return this.exclusive(async () => {
+      const pending = await this.readHistory(() => this.deps.history.pending());
+      for (const entry of pending) await this.record(historyBase(entry, 'failed', 'dismissed by owner'));
+      return pending.length;
+    });
+  }
+
+  /** A sent or confirmed launch of this very draft, if any. A draft is launched at most once. */
+  async priorLaunch(draftId: string): Promise<HistoryEntry | undefined> {
+    const entries = await this.readHistory(() => this.deps.history.launchesOfDraft(draftId));
+    return entries.find((e) => e.status === 'sent' || e.status === 'unknown' || e.status === 'confirmed');
+  }
+
+  /** The history is what stops a second launch: when it cannot be read, nothing is launched. */
+  private async readHistory<T>(read: () => Promise<T>): Promise<T> {
+    try {
+      return await read();
+    } catch (err) {
+      throw new UserFacingError(
+        `Riwayat launch tidak bisa dibaca (${describeError(err).split('\n')[0]}), jadi launch diblokir demi keamanan. Periksa folder data (DATA_DIR) lalu coba lagi.`,
+        { cause: err },
+      );
+    }
+  }
+
+  /** A transaction of this wallet that is still waiting for a block would be overtaken by (or collide with) a new one. */
+  private async assertWalletIdle(chainId: number): Promise<void> {
+    const waiting = await this.deps.wallet.pendingTransactionCount(chainId);
+    if (waiting > 0) {
+      throw new UserFacingError(
+        `Wallet bot masih punya ${waiting} transaksi yang belum terkonfirmasi di jaringan ini. Tunggu sampai selesai (atau bereskan di explorer), lalu coba lagi.`,
+      );
+    }
   }
 
   /** Runs one launch end to end. Only one launch may run at a time (single wallet, single nonce stream). */
@@ -214,8 +320,14 @@ export class Launcher {
     progress({ stage: 'checking' });
     const pending = await this.pendingLaunches();
     if (pending.length > 0) throw new PendingLaunchError(pending);
+    const prior = await this.priorLaunch(draft.id);
+    if (prior) throw new DraftAlreadyLaunchedError(prior);
+    await this.assertWalletIdle(chainId);
 
     const ctx = await resolveLaunchContext(catalog, draft, { fresh: true });
+    if (!sameContracts(contractsOf(ctx.suite), job.reviewedContracts)) {
+      throw new UserFacingError('Alamat kontrak o1 berubah sejak Review. Buka Review lagi, periksa alamatnya, lalu konfirmasi ulang.');
+    }
     this.assertFeeNotHigher(ctx, job.reviewedFee);
     const feeNative = ctx.fee?.isNative ? ctx.fee.amountRaw : 0n;
     const feeToken = ctx.fee && !ctx.fee.isNative ? ctx.fee : null;
@@ -226,15 +338,13 @@ export class Launcher {
       from: wallet.address,
       suite: ctx.suite,
       kind: 'launch',
-      quoteAddress: ctx.quote.address,
-      feeCurrency: feeToken?.currency,
+      // A launch needs no allowance for the pair; the only ERC-20 it may touch is an ERC-20 creation fee.
+      erc20: feeToken ? [{ address: feeToken.currency, maxApprove: feeToken.amountRaw, maxPermit: 0n }] : [],
       maxTotalNativeValue: feeNative,
-      maxApproveAmount: feeToken ? feeToken.amountRaw : 0n,
-      maxPermitAmount: 0n,
       extraTargets: this.deps.extraTargets,
       nowSec: this.nowSec,
     });
-    const baseMeta = { chainId, product: draft.product, name: draft.name ?? undefined, symbol: draft.symbol ?? undefined, quote: ctx.quote.address };
+    const baseMeta = { chainId, product: draft.product, draftId: draft.id, name: draft.name ?? undefined, symbol: draft.symbol ?? undefined, quote: ctx.quote.address };
 
     const sentApprovals = new Set<string>();
     let plan: LaunchPrepareResult | undefined;
@@ -281,13 +391,23 @@ export class Launcher {
       launch = await this.sendStep(last, checked[steps.length - 1] as CheckedTx, { kind: 'launch', stage: 'sending', meta }, progress);
     }
 
+    // From here on the launch is done and paid for. Nothing below may turn it into an error: a thrown exception
+    // would tell the owner "launch failed" and invite a second one.
     const token = (plan as LaunchPrepareResult).predicted_token_address;
-    progress({ stage: 'verifying' });
-    const codeVerified = await this.verifyCode(chainId, token);
-
-    const outcome: LaunchOutcome = { chainId, token, launchTx: launch.hash, codeVerified };
+    const outcome: LaunchOutcome = { chainId, token, launchTx: launch.hash, codeVerified: false };
+    try {
+      progress({ stage: 'verifying' });
+      outcome.codeVerified = await this.verifyCode(chainId, token);
+    } catch (err) {
+      this.deps.log.warn('token code verification failed', err);
+    }
     if (draft.devBuy.enabled && draft.devBuy.amountRaw) {
-      outcome.devBuy = await this.devBuy(draft, ctx, token, launch.receipt.blockNumber, baseMeta, progress);
+      try {
+        outcome.devBuy = await this.devBuy(draft, ctx, token, launch.receipt.blockNumber, baseMeta, progress);
+      } catch (err) {
+        this.deps.log.warn('dev buy crashed', err);
+        outcome.devBuy = { status: 'failed', reason: describeError(err) };
+      }
     }
     return outcome;
   }
@@ -387,6 +507,17 @@ export class Launcher {
         chainId,
       );
     }
+    if (receipt.transactionHash.toLowerCase() !== signed.hash.toLowerCase()) {
+      // Another transaction with the same nonce was mined instead (a cancel or speed-up made elsewhere). Ours did
+      // not run, but the replacement may have done the very same launch, so nothing is assumed.
+      await this.record({ ...opts.meta, kind: opts.kind, status: 'unknown', txHash: signed.hash, note: `replaced by ${receipt.transactionHash}` });
+      throw new TxUnknownError(
+        `Transaksi ini digantikan oleh transaksi lain dengan nonce yang sama (${receipt.transactionHash}). ` +
+          'Cek keduanya di explorer sebelum melakukan apa pun agar tidak terjadi dobel.',
+        signed.hash,
+        chainId,
+      );
+    }
     if (receipt.status !== 'success') {
       await this.record({ ...opts.meta, kind: opts.kind, status: 'reverted', txHash: signed.hash });
       throw new TxRevertedError('Transaksi ter-revert di chain (gas tetap terpakai).', signed.hash, chainId);
@@ -445,10 +576,9 @@ export class Launcher {
       from: wallet.address,
       suite: ctx.suite,
       kind: 'swap',
-      quoteAddress: ctx.quote.address,
+      // The pair is the only token a buy pays with; its allowance and permit may cover at most the dev buy.
+      erc20: native ? [] : [{ address: ctx.quote.address, maxApprove: amount, maxPermit: amount }],
       maxTotalNativeValue: native ? amount : 0n,
-      maxApproveAmount: amount,
-      maxPermitAmount: amount,
       extraTargets: this.deps.extraTargets,
       nowSec: this.nowSec,
     });
@@ -499,8 +629,8 @@ export class Launcher {
         let signature: Hex | undefined;
         const typed = extractTypedData(quote);
         if (typed) {
-          assertTypedDataAllowed(typed, policy);
-          signature = await wallet.signTypedData(chainId, coerceTypedData(typed));
+          // What is signed is the payload rebuilt from the validated fields, not the API's own object.
+          signature = await wallet.signTypedData(chainId, assertTypedDataAllowed(typed, policy));
         }
 
         let prepared;
@@ -545,7 +675,7 @@ export class Launcher {
       this.deps.log.warn(`dev buy failed: ${describeError(err)}`);
       await this.record({ ...meta, kind: 'devbuy', status: 'failed', note: describeError(err).slice(0, 300) });
       const txHash = err instanceof TxRevertedError || err instanceof TxUnknownError ? (err.txHash as Hash) : undefined;
-      return { status: 'failed', reason: describeError(err), txHash };
+      return { status: 'failed', reason: describeError(err), txHash, unknown: err instanceof TxUnknownError };
     }
   }
 
@@ -621,6 +751,23 @@ export class Launcher {
       );
     }
   }
+}
+
+/** The history record that settles `entry` with a new status, keeping everything that identifies it. */
+function historyBase(entry: HistoryEntry, status: HistoryEntry['status'], note: string): Omit<HistoryEntry, 'ts'> {
+  return {
+    kind: 'launch',
+    status,
+    chainId: entry.chainId,
+    product: entry.product,
+    draftId: entry.draftId,
+    name: entry.name,
+    symbol: entry.symbol,
+    token: entry.token,
+    quote: entry.quote,
+    txHash: entry.txHash,
+    note,
+  };
 }
 
 function approvalKey(tx: CheckedTx): string {

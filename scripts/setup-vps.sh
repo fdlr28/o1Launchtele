@@ -354,8 +354,9 @@ WorkingDirectory=${APP_DIR}
 ExecStart=${node_bin} dist/index.js
 Restart=on-failure
 RestartSec=10
-# Saat dihentikan, bot menunggu launch yang sedang berjalan sampai selesai (maks 120 detik); jangan dipotong.
-TimeoutStopSec=150
+# Saat dihentikan, bot menunggu launch yang sedang berjalan sampai selesai (maks 240 detik) lalu mengirim
+# pesan hasilnya (maks 15 detik); systemd tidak boleh memotongnya lebih cepat dari itu.
+TimeoutStopSec=270
 
 # Pengamanan: bot hanya butuh jaringan keluar dan folder data miliknya sendiri.
 NoNewPrivileges=true

@@ -7,6 +7,7 @@ import {
   createWalletClient,
   defineChain,
   erc20Abi,
+  formatUnits,
   http,
   keccak256,
   type Address,
@@ -17,13 +18,18 @@ import {
   type WalletClient,
 } from 'viem';
 import { privateKeyToAccount, type PrivateKeyAccount } from 'viem/accounts';
-import { CHAINS } from '../chains.js';
+import { CHAINS, DEFAULT_MAX_GAS_COST_WEI } from '../chains.js';
 import { UserFacingError } from '../errors.js';
 import type { Logger } from '../logger.js';
 import type { SafeTx } from '../services/guard.js';
 
 export interface Receipt {
   status: 'success' | 'reverted';
+  /**
+   * Hash of the transaction that was actually mined. viem follows a same-nonce replacement (a cancel or a
+   * speed-up made from another client), so this can differ from the hash that was asked for.
+   */
+  transactionHash: Hash;
   blockNumber: bigint;
   gasUsed: bigint;
 }
@@ -66,8 +72,10 @@ export interface Wallet {
   broadcast(chainId: number, signed: SignedTx): Promise<void>;
   /** Looks a transaction up by hash. Throws only when the RPC itself cannot be reached. */
   transactionStatus(chainId: number, hash: Hash): Promise<TxStatus>;
-  /** Throws when the timeout elapses; the transaction may still confirm later. */
+  /** Throws when the timeout elapses; the transaction may still confirm later. Check `transactionHash` on the result. */
   waitForReceipt(chainId: number, hash: Hash, timeoutMs?: number): Promise<Receipt>;
+  /** How many transactions of this wallet are waiting in the mempool (pending nonce minus confirmed nonce). */
+  pendingTransactionCount(chainId: number): Promise<number>;
   hasCode(chainId: number, address: Address): Promise<boolean>;
   /** Unix seconds of a block (latest when omitted). */
   blockTimestamp(chainId: number, blockNumber?: bigint): Promise<number>;
@@ -92,17 +100,58 @@ const GAS_BUFFER_DEN = 100n;
 /** Node replies that mean "I already have this exact transaction": it is not a rejection. */
 const ALREADY_KNOWN = /already known|known transaction|already imported|already in the (?:mempool|pool)/i;
 
-/** True when the node itself answered with a JSON-RPC error (as opposed to a transport failure). */
-function isNodeRejection(err: unknown): boolean {
-  if (!(err instanceof BaseError)) return false;
-  const rpc = err.walk((e) => e instanceof RpcError);
-  if (!rpc) return false;
-  return !ALREADY_KNOWN.test(`${rpc.message} ${(rpc as { details?: string }).details ?? ''}`);
+/**
+ * Node replies that PROVE the transaction did not enter the pool. Only these count as a rejection: a generic
+ * error (-32603 internal error, a timeout, a busy node) can be sent for a transaction that was accepted anyway,
+ * and calling that a rejection would release the lock and invite a second launch.
+ */
+const DEFINITE_REJECTION = new RegExp(
+  [
+    'nonce (?:is )?too low',
+    'replacement transaction underpriced',
+    'transaction underpriced',
+    'insufficient funds',
+    'intrinsic gas too low',
+    'exceeds block gas limit',
+    'gas limit (?:exceeded|reached|too high)',
+    'max fee per gas less than block base fee',
+    'fee cap (?:is )?(?:too low|less than)',
+    'invalid sender',
+    'invalid chain id',
+    'invalid signature',
+    'oversized data',
+    'transaction type not supported',
+    'exceeds (?:the )?(?:configured )?(?:tx )?fee cap',
+  ].join('|'),
+  'i',
+);
+
+const firstLine = (text: string | undefined): string => (text ?? '').split('\n')[0] ?? '';
+
+/**
+ * The node's own words for an error. viem hides them behind a generic short message ("Missing or invalid
+ * parameters") and keeps the node's text in `details`. The full `message` is not used: it carries the RPC URL.
+ */
+function nodeText(err: unknown): string {
+  if (!(err instanceof BaseError)) return '';
+  const rpc = err.walk((e) => e instanceof RpcError) as (RpcError & { details?: string }) | null;
+  return rpc ? `${firstLine(rpc.shortMessage)} ${rpc.details ?? ''} ${firstLine(rpc.message)}`.trim() : '';
 }
 
+/** True only when the node answered, and its answer proves that it did not take the transaction. */
+function isNodeRejection(err: unknown): boolean {
+  const text = nodeText(err);
+  if (!text) return false;
+  if (ALREADY_KNOWN.test(text)) return false;
+  return DEFINITE_REJECTION.test(text);
+}
+
+/** One line for humans: viem's short message plus, when there is one, the node's own words. */
 function reasonOf(err: unknown): string {
   const short = (err as { shortMessage?: string }).shortMessage;
-  return (short ?? (err instanceof Error ? err.message : String(err))).split('\n')[0] ?? '';
+  const base = firstLine(short ?? (err instanceof Error ? err.message : String(err)));
+  const details = firstLine((err as { details?: string }).details);
+  return details && !base.includes(details) ? `${base} — ${details}` : base;
 }
 
 export class ViemWallet implements Wallet {
@@ -190,6 +239,19 @@ export class ViemWallet implements Wallet {
 
     this.log?.debug(`signing tx on chain ${chainId} to ${tx.to} (gas ${gas})`);
     const request = await client.prepareTransactionRequest({ account: this.account, chain, to: tx.to, data: tx.data, value: tx.value, gas });
+
+    // A broken or hostile RPC could quote an absurd fee and have the wallet burn its balance on gas.
+    const info = CHAINS[chainId];
+    const cap = info?.maxGasCostWei ?? DEFAULT_MAX_GAS_COST_WEI;
+    const perGas = request.maxFeePerGas ?? request.gasPrice ?? 0n;
+    const worstCase = gas * perGas;
+    if (worstCase > cap) {
+      const symbol = info?.nativeSymbol ?? 'native';
+      throw new UserFacingError(
+        `Biaya gas maksimum ${formatUnits(worstCase, 18)} ${symbol} melebihi batas keamanan ${formatUnits(cap, 18)} ${symbol}. ` +
+          'RPC atau jaringan sedang tidak normal; tidak ada yang dikirim. Coba lagi nanti atau ganti RPC.',
+      );
+    }
     const raw = await this.account.signTransaction(request as Parameters<PrivateKeyAccount['signTransaction']>[0]);
     return { hash: keccak256(raw), raw };
   }
@@ -225,7 +287,16 @@ export class ViemWallet implements Wallet {
 
   async waitForReceipt(chainId: number, hash: Hash, timeoutMs = 180_000): Promise<Receipt> {
     const receipt = await this.pub(chainId).waitForTransactionReceipt({ hash, timeout: timeoutMs, pollingInterval: 1000 });
-    return { status: receipt.status, blockNumber: receipt.blockNumber, gasUsed: receipt.gasUsed };
+    return { status: receipt.status, transactionHash: receipt.transactionHash, blockNumber: receipt.blockNumber, gasUsed: receipt.gasUsed };
+  }
+
+  async pendingTransactionCount(chainId: number): Promise<number> {
+    const pub = this.pub(chainId);
+    const [confirmed, pending] = await Promise.all([
+      pub.getTransactionCount({ address: this.address, blockTag: 'latest' }),
+      pub.getTransactionCount({ address: this.address, blockTag: 'pending' }),
+    ]);
+    return Math.max(0, pending - confirmed);
   }
 
   async hasCode(chainId: number, address: Address): Promise<boolean> {

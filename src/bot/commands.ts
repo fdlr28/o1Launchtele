@@ -77,8 +77,12 @@ export function registerCommands(bot: Bot<BotContext>, deps: BotDeps, ui: Ui): v
       );
       return void (await ctx.reply(lines.join('\n'), HTML));
     }
-    const count = await deps.launcher.dismissPending();
-    await ctx.reply(`Diabaikan: ${count} launch tertunda. Kamu bisa /launch lagi.`);
+    try {
+      const count = await deps.launcher.dismissPending();
+      await ctx.reply(`Diabaikan: ${count} launch tertunda. Kamu bisa /launch lagi.`);
+    } catch (err) {
+      await ctx.reply(`Gagal: ${describeError(err)}`);
+    }
   });
 
   bot.command('wallet', async (ctx) => {
@@ -99,7 +103,12 @@ export function registerCommands(bot: Bot<BotContext>, deps: BotDeps, ui: Ui): v
   });
 
   bot.command('history', async (ctx) => {
-    const rows = await deps.history.recent('launch', 5);
+    let rows;
+    try {
+      rows = await deps.history.recent('launch', 5);
+    } catch (err) {
+      return void (await ctx.reply(`Riwayat tidak bisa dibaca: ${describeError(err)}`));
+    }
     if (rows.length === 0) return void (await ctx.reply('Belum ada launch tercatat.'));
     const lines = ['🕘 <b>Launch terakhir</b>', ''];
     for (const row of rows) {

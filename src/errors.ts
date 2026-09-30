@@ -40,7 +40,12 @@ export function setErrorSanitizer(fn: (text: string) => string): void {
 
 /** Plain-text (not HTML-escaped) description of any error, in Indonesian. */
 export function describeError(err: unknown): string {
-  return sanitizer(describeErrorRaw(err));
+  // This runs inside catch blocks after money has moved: it must never be the thing that throws.
+  try {
+    return sanitizer(describeErrorRaw(err));
+  } catch {
+    return 'Terjadi kesalahan yang tidak bisa dijelaskan. Periksa log server.';
+  }
 }
 
 function describeErrorRaw(err: unknown): string {
@@ -60,8 +65,9 @@ function describeApiError(err: ApiError): string {
 
   switch (err.code) {
     case 'insufficient_balance': {
-      const native = p?.asset?.toLowerCase() === zeroAddress;
-      const fmt = (raw?: string) => (raw === undefined ? '?' : native ? formatUnits(BigInt(raw), 18) : raw);
+      const native = typeof p?.asset === 'string' && p.asset.toLowerCase() === zeroAddress;
+      // API text is not trusted to be a number
+      const fmt = (raw?: unknown) => (typeof raw !== 'string' ? '?' : native && /^\d+$/.test(raw) ? formatUnits(BigInt(raw), 18) : raw.slice(0, 40));
       lines.push(`Saldo kurang${native ? '' : ` untuk aset ${p?.asset}`}: punya ${fmt(p?.actual_raw)}, butuh ${fmt(p?.required_raw)}${native ? ' (native)' : ' (satuan terkecil)'}.`);
       break;
     }

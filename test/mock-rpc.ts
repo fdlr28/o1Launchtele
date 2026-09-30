@@ -30,6 +30,19 @@ export class MockRpc {
   dropNextSendReply = false;
   /** The next eth_sendRawTransaction is refused with a JSON-RPC error. */
   failNextSend: { code: number; message: string } | null = null;
+  /** ... but the node put the transaction in its pool anyway (a busy or load-balanced node answering with an error). */
+  failNextSendStillAccepts = false;
+  /** Fee knobs (wei). */
+  priorityFee = 1_000_000_000;
+  baseFee = 1_000_000_000;
+  /** Lookups by hash (eth_getTransactionByHash / Receipt) come back empty: a lagging backend that has not caught up. */
+  hideFromLookups = false;
+  /**
+   * The next accepted transaction is replaced: shortly after, a DIFFERENT transaction with the same sender and
+   * nonce is mined instead (a cancel or speed-up made from another client that holds the same key).
+   */
+  replaceNextTransaction = false;
+  replacement: { hash: Hex; block: number; nonce: number; from: string; replaces: Hex } | null = null;
   /** When false, accepted transactions stay pending (no receipt) until mine() is called. */
   autoMine = true;
   private readonly mined = new Set<string>();
@@ -51,6 +64,10 @@ export class MockRpc {
               if (this.failNextSend) {
                 const fault = this.failNextSend;
                 this.failNextSend = null;
+                if (this.failNextSendStillAccepts) {
+                  this.failNextSendStillAccepts = false;
+                  await this.handle(call.method, call.params ?? []);
+                }
                 return { jsonrpc: '2.0', id: call.id, error: { code: fault.code, message: fault.message } };
               }
             }
@@ -88,7 +105,15 @@ export class MockRpc {
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
   }
 
-  private blockObject(number: number) {
+  private replacementTx(r: NonNullable<MockRpc['replacement']>) {
+    return {
+      hash: r.hash, nonce: toHex(r.nonce), blockHash: keccak256(toHex(r.block)), blockNumber: toHex(r.block), transactionIndex: '0x0',
+      from: r.from, to: r.from, value: '0x0', gas: '0x5208', gasPrice: '0x77359400', input: '0x', type: '0x2', chainId: toHex(this.chainId), v: '0x0', r: '0x1', s: '0x1',
+    };
+  }
+
+  private blockObject(number: number, includeTransactions = false) {
+    const replaced = this.replacement && number >= this.replacement.block ? [this.replacementTx(this.replacement)] : [];
     return {
       number: toHex(number),
       hash: keccak256(toHex(number)),
@@ -96,7 +121,7 @@ export class MockRpc {
       timestamp: toHex(1_700_000_000 + number),
       gasLimit: toHex(30_000_000),
       gasUsed: toHex(1_000_000),
-      baseFeePerGas: toHex(1_000_000_000),
+      baseFeePerGas: toHex(this.baseFee),
       miner: '0x0000000000000000000000000000000000000000',
       nonce: '0x0000000000000000',
       difficulty: '0x0',
@@ -109,7 +134,7 @@ export class MockRpc {
       transactionsRoot: keccak256('0x03'),
       size: '0x100',
       uncles: [],
-      transactions: [],
+      transactions: includeTransactions ? replaced : [],
     };
   }
 
@@ -121,14 +146,15 @@ export class MockRpc {
         return toHex(this.block);
       case 'eth_getBlockByNumber': {
         const tag = params[0] as string;
-        return this.blockObject(tag === 'latest' || tag === 'pending' ? this.block : Number(BigInt(tag)));
+        return this.blockObject(tag === 'latest' || tag === 'pending' ? this.block : Number(BigInt(tag)), params[1] === true);
       }
       case 'eth_getTransactionCount':
-        return toHex(5 + this.received.length);
+        // "pending" counts everything the node accepted; every other tag only what was mined
+        return toHex(5 + (params[1] === 'pending' ? this.received.length : this.received.filter((r) => this.mined.has(r.hash)).length));
       case 'eth_gasPrice':
-        return toHex(2_000_000_000);
+        return toHex(this.baseFee + this.priorityFee);
       case 'eth_maxPriorityFeePerGas':
-        return toHex(1_000_000_000);
+        return toHex(this.priorityFee);
       case 'eth_estimateGas':
         this.estimateParams.push(params[0]);
         if (this.estimateError) throw this.estimateError;
@@ -146,12 +172,21 @@ export class MockRpc {
         const hash = keccak256(raw);
         this.received.push({ hash, raw, tx, from });
         this.receipts.set(hash, { blockNumber: this.block + 1, status: this.revertNext ? '0x0' : '0x1' });
-        if (this.autoMine) this.mined.add(hash);
+        if (this.replaceNextTransaction) {
+          this.replaceNextTransaction = false;
+          setTimeout(() => {
+            this.block++;
+            this.replacement = { hash: keccak256(toHex(`replacement:${hash}`)), block: this.block, nonce: Number(tx.nonce ?? 0), from, replaces: hash };
+          }, 200);
+        } else if (this.autoMine) this.mined.add(hash);
         return hash;
       }
       case 'eth_getTransactionByHash': {
+        if (this.hideFromLookups) return null;
+        if (this.replacement && params[0] === this.replacement.hash) return this.replacementTx(this.replacement);
         const found = this.received.find((r) => r.hash === params[0]);
         if (!found) return null;
+        if (this.replacement?.replaces === found.hash) return null; // the node dropped it in favour of the replacement
         const receipt = this.receipts.get(found.hash)!;
         const isMined = this.mined.has(found.hash);
         return {
@@ -174,6 +209,15 @@ export class MockRpc {
         };
       }
       case 'eth_getTransactionReceipt': {
+        if (this.hideFromLookups) return null;
+        if (this.replacement && params[0] === this.replacement.hash) {
+          const r = this.replacement;
+          return {
+            transactionHash: r.hash, transactionIndex: '0x0', blockHash: keccak256(toHex(r.block)), blockNumber: toHex(r.block), from: r.from, to: r.from,
+            cumulativeGasUsed: '0x5208', gasUsed: '0x5208', effectiveGasPrice: '0x77359400', contractAddress: null, logs: [],
+            logsBloom: `0x${'00'.repeat(256)}`, status: '0x1', type: '0x2',
+          };
+        }
         const found = this.received.find((r) => r.hash === params[0]);
         const receipt = found && this.receipts.get(found.hash);
         if (!found || !receipt || !this.mined.has(found.hash)) return null;

@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ApiError } from '../src/o1/client.js';
 import { OWNER, PNG_BYTES, STRANGER, createHarness, type Harness } from './bot-harness.js';
-import { AAPL, ROUTER, TOKEN, TOKENS_10K, USDC, WALLET, ZERO, RECIPIENT, addr, configFor, quote } from './fixtures.js';
+import { AAPL, FACTORY, ROUTER, TOKEN, TOKENS_10K, USDC, WALLET, ZERO, RECIPIENT, addr, configFor, quote } from './fixtures.js';
 
 let h: Harness;
 
@@ -473,6 +473,31 @@ describe('review', () => {
     expect(h.panelText()).toContain('Jumlah dev buy belum diisi');
   });
 
+  it('shows the o1 contracts that will receive the money, and the router only when a dev buy is planned', async () => {
+    await fillBasics();
+    await h.press('nav:review');
+    expect(h.panelText()).toContain('Kontrak o1 yang menerima dana');
+    expect(h.panelText()).toContain(FACTORY);
+    expect(h.panelText()).not.toContain(ROUTER);
+    expect(h.state().reviewed?.contracts).toMatchObject({ factory: FACTORY.toLowerCase(), swapRouter: ROUTER.toLowerCase() });
+
+    await h.press('nav:dev');
+    await h.press('tog:dev');
+    await h.press('in:devAmount:dev');
+    await h.text('0.05');
+    await h.press('nav:review');
+    expect(h.panelText()).toContain(`Router swap: <code>${ROUTER}</code>`);
+  });
+
+  it('refuses a green light when the history cannot be read', async () => {
+    mkdirSync(join(h.dataDir, 'launches.jsonl'), { recursive: true }); // EISDIR, not "no history"
+    await fillBasics();
+    await h.press('nav:review');
+    expect(h.panelText()).toContain('Riwayat launch tidak bisa dibaca');
+    expect(h.hasButton('go:launch')).toBe(false);
+    expect(h.state().reviewed).toBeNull();
+  });
+
   it('blocks while an earlier launch is still unresolved', async () => {
     seedPendingLaunch();
     await fillBasics();
@@ -512,6 +537,52 @@ describe('review', () => {
     expect(h.wallet.sent).toHaveLength(0);
     expect(h.state().reviewed).toBeNull();
     expect(h.launcher.isBusy()).toBe(false);
+  });
+
+  describe('the review is invalidated by ANY change that reaches the launch (round-2 review)', () => {
+    const edits: Array<[string, (d: NonNullable<ReturnType<typeof h.state>['draft']>) => void]> = [
+      ['name', (d) => void (d.name = 'Other')],
+      ['symbol', (d) => void (d.symbol = 'OTHER')],
+      ['description', (d) => void (d.description = 'changed')],
+      ['website', (d) => void (d.website = 'https://other.example')],
+      ['x', (d) => void (d.x = 'https://x.com/other')],
+      ['telegram', (d) => void (d.telegram = 'https://t.me/other')],
+      ['image bytes', (d) => void (d.image = { ...d.image!, base64: Buffer.from('different image bytes').toString('base64') })],
+      ['image type', (d) => void (d.image = { ...d.image!, type: 'image/jpeg' })],
+      ['buy tax', (d) => void (d.tax.buyRate = '2000000')],
+      ['sell tax', (d) => void (d.tax.sellRate = '2000000')],
+      ['tax split', (d) => void (d.tax.creatorShare = '50000000')],
+      ['tax recipient', (d) => void (d.tax.creatorRecipient = addr(0x7777))],
+      ['anti-snipe', (d) => void (d.tax.antiSnipe = !d.tax.antiSnipe)],
+      ['dev buy on', (d) => void (d.devBuy.enabled = true)],
+      ['dev buy amount', (d) => void (d.devBuy.amountRaw = '123')],
+      ['dev buy slippage', (d) => void (d.devBuy.slippageBps = 999)],
+      ['dev buy timing', (d) => void (d.devBuy.timing = 'now')],
+      ['pair', (d) => void (d.quote = { ...d.quote!, address: USDC, symbol: 'USDC' })],
+      ['chain', (d) => void (d.chainId = 56)],
+      ['product', (d) => void (d.product = 'non-tax')],
+      ['editable profile', (d) => void (d.editableMetadata = !d.editableMetadata)],
+    ];
+
+    it.each(edits)('%s', async (_name, change) => {
+      await fillBasics();
+      await h.press('nav:review');
+      expect(h.state().reviewed).not.toBeNull();
+      change(h.state().draft!);
+      await h.press('go:launch');
+      expect(h.alerts().at(-1)).toContain('Draft berubah sejak Review');
+      expect(h.wallet.broadcasts).toHaveLength(0);
+    });
+
+    it('but the same draft reviewed twice launches', async () => {
+      await fillBasics();
+      await h.press('nav:review');
+      await h.press('nav:dash');
+      await h.press('nav:review');
+      await h.press('go:launch');
+      await h.settled();
+      expect(h.wallet.sent).toHaveLength(1);
+    });
   });
 
   it('escapes hostile pair symbols in every view that shows them', async () => {
@@ -695,13 +766,15 @@ describe('launching', () => {
     expect(h.wallet.broadcasts).toHaveLength(1);
   });
 
-  it('an unconfirmed launch blocks the next one and points to /dismiss', async () => {
+  it('an unconfirmed launch is reported as unclear (not as a failure), blocks the next one and points to /dismiss', async () => {
     h.wallet.receipts = ['timeout'];
     await fillBasics();
     await h.press('nav:review');
     await h.press('go:launch');
     await h.settled();
-    expect(h.panelText()).toContain('Launch gagal');
+    expect(h.panelText()).toContain('Hasil launch belum jelas');
+    expect(h.panelText()).toContain('Jangan launch ulang');
+    expect(h.panelText()).not.toContain('Draft-mu masih tersimpan'); // that line invited exactly the wrong thing
     const hash = h.wallet.sent[0]!.hash;
     expect(h.panelText()).toContain(hash);
     h.wallet.statuses.set(hash, 'pending');
@@ -712,11 +785,103 @@ describe('launching', () => {
     expect(h.hasButton('go:launch')).toBe(false);
   });
 
+  it('a launch that confirmed after the "unclear" report cannot be launched again with the same draft (relaunch trap)', async () => {
+    h.wallet.receipts = ['timeout'];
+    await fillBasics();
+    await h.press('nav:review');
+    await h.press('go:launch');
+    await h.settled();
+    const hash = h.wallet.sent[0]!.hash;
+
+    // it mines a little later, and the bot notices silently
+    h.wallet.statuses.set(hash, 'success');
+    await h.press('nav:dash');
+    await h.press('nav:review');
+    expect(h.panelText()).toContain('Draft ini sudah berhasil di-launch');
+    expect(h.panelText()).toContain('token kembar');
+    expect(h.hasButton('go:launch')).toBe(false);
+    expect(h.state().reviewed).toBeNull();
+
+    await h.press('go:launch'); // even a stale or forged button changes nothing
+    expect(h.alerts().at(-1)).toContain('Review');
+    expect(h.wallet.broadcasts).toHaveLength(1);
+
+    // a fresh draft is the owner's explicit choice
+    await h.press('go:reset');
+    expect(h.state().draft?.name).toBeNull();
+  });
+
+  it('aborts, and asks for a new review, when the o1 contracts change between review and launch', async () => {
+    await fillBasics();
+    await h.press('nav:review');
+    const cfg = configFor('tax');
+    cfg.suites![0]!.contracts.factory = addr(0x9999);
+    h.api.configs.tax = cfg;
+    await h.press('go:launch');
+    await h.settled();
+    expect(h.panelText()).toContain('Launch gagal');
+    expect(h.panelText()).toContain('Alamat kontrak o1 berubah sejak Review');
+    expect(h.wallet.broadcasts).toHaveLength(0);
+    expect(h.state().reviewed).toBeNull();
+  });
+
+  it('reports a dev buy whose swap may still land as unclear, and does not tell the owner to buy by hand', async () => {
+    h.api.swapPrepareImpl = async () => ({
+      steps: [
+        {
+          id: 'swap', kind: 'transaction', label: 'Swap', depends_on: [],
+          transaction: { chain_id: 8453, from: WALLET, to: ROUTER, data: '0xfeed', value: '50000000000000000' },
+          simulation: { status: 'succeeded' },
+        },
+      ],
+    });
+    h.wallet.broadcastBehaviors = ['ok', 'uncertain-lost'];
+    await fillBasics();
+    await h.press('nav:dev');
+    await h.press('tog:dev');
+    await h.press('in:devAmount:dev');
+    await h.text('0.05');
+    await h.press('nav:review');
+    await h.press('go:launch');
+    await h.settled();
+    const text = h.panelText();
+    expect(text).toContain('Launch berhasil');
+    expect(text).toContain('hasilnya belum jelas');
+    expect(text).toContain('SEBELUM membeli manual');
+    expect(text).not.toContain('Kamu bisa beli manual');
+  });
+
   it('will not launch before the review, or when the draft became invalid', async () => {
     await fillBasics();
     await h.press('go:launch'); // from the dashboard, not the review panel
     expect(h.alerts().at(-1)).toContain('Review');
     expect(h.wallet.sent).toHaveLength(0);
+  });
+});
+
+describe('strangers cannot slow the owner down (round-2 review)', () => {
+  const rejections = () => h.sentTexts().filter((t) => t.includes('Akses ditolak'));
+
+  it('a stranger is told once a minute at most, however much they send', async () => {
+    for (let i = 0; i < 6; i++) await h.command('launch', STRANGER);
+    await h.press('go:launch', { userId: STRANGER });
+    expect(rejections()).toHaveLength(1);
+    expect(h.alerts()).toHaveLength(0); // ... and the button press was ignored quietly
+    await h.command('launch', 8); // another stranger has their own allowance
+    expect(rejections()).toHaveLength(2);
+  });
+
+  it('a reply to a stranger that hangs (flood control) never holds up the owner', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    h.bot.api.config.use(async (prev, method, payload) => {
+      if (method === 'sendMessage' && (payload as { chat_id: number }).chat_id === STRANGER) await gate;
+      return prev(method, payload);
+    });
+    await h.command('launch', STRANGER); // returns although Telegram is "busy" with the reply
+    await h.command('launch');
+    expect(h.panelText()).toContain('Draft Launch o1');
+    release();
   });
 });
 

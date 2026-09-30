@@ -181,7 +181,10 @@ export class Ui {
       case 'review': {
         const review = await buildReview({ catalog: this.deps.catalog, wallet: this.deps.wallet, launcher: this.deps.launcher }, draft);
         // Only a passing review can be confirmed, and only for exactly this draft.
-        state.reviewed = review.ok && review.reviewedFee ? { fee: review.reviewedFee, fingerprint: draftFingerprint(draft) } : null;
+        state.reviewed =
+          review.ok && review.reviewedFee && review.contracts
+            ? { fee: review.reviewedFee, contracts: review.contracts, fingerprint: draftFingerprint(draft) }
+            : null;
         return {
           text: reviewText(draft, review, name, this.deps.wallet.address),
           keyboard: reviewKeyboard(review.ok),

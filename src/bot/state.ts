@@ -1,7 +1,7 @@
 import type { Context } from 'grammy';
 import type { Draft } from '../domain/draft.js';
 import type { PairFilter } from '../o1/catalog.js';
-import type { ReviewedFee } from '../services/launcher.js';
+import type { ReviewedContracts, ReviewedFee } from '../services/launcher.js';
 
 export const FIELD_KEYS = [
   'name',
@@ -50,6 +50,8 @@ export interface PairUi {
 /** What the owner saw and confirmed on the review screen: the fee, and the exact draft it was computed for. */
 export interface ReviewedSnapshot {
   fee: ReviewedFee;
+  /** The o1 contracts shown in the review; the launch aborts if the live /config names others. */
+  contracts: ReviewedContracts;
   fingerprint: string;
 }
 
