@@ -43,11 +43,52 @@ API o1 tidak pernah menandatangani atau broadcast apa pun; bot yang melakukannya
 
 ## Menjalankan
 
-Bot harus jalan di **mesin atau server milikmu sendiri** (PC, VPS, atau HP dengan Termux), bukan di sesi Claude Code
-cloud: kunci privat tidak seharusnya masuk ke sana, dan bot perlu jalan terus-menerus.
+Bot harus jalan di **mesin atau server milikmu sendiri**, bukan di sesi Claude Code cloud: kunci privat tidak
+seharusnya masuk ke sana, dan bot perlu hidup terus-menerus.
+
+### Di VPS (disarankan)
+
+Butuh VPS Linux dengan systemd (Debian/Ubuntu/RHEL dan turunannya). Login lewat SSH, lalu:
 
 ```bash
-git clone --branch claude/eager-clarke-wbiki8 https://github.com/fdlr28/o1Launchtele.git
+git clone https://github.com/fdlr28/o1Launchtele.git
+cd o1Launchtele
+sudo bash scripts/setup-vps.sh
+```
+
+Repo ini publik, jadi tidak perlu login GitHub. Baca skripnya dulu kalau mau (`less scripts/setup-vps.sh`); skrip ini
+menangani private key, jadi jangan dijalankan lewat `curl | bash`.
+
+Skrip akan:
+
+1. Memastikan Node.js 20+ (kalau belum ada, mengunduh dari nodejs.org dan **memverifikasi SHA-256**).
+2. Membuat user sistem tanpa login (`o1bot`) yang menjalankan bot, dan menyalin aplikasi ke `/opt/o1launchtele`.
+3. Menanyakan **token bot, ID Telegram, private key, API key o1, chain, dan RPC**. Input rahasia tersembunyi, tidak masuk
+   histori shell, dan hanya ditulis ke `/opt/o1launchtele/.env` dengan izin `600`.
+4. `npm ci`, build, lalu `npm run doctor`. **Kalau doctor menemukan masalah, service tidak dinyalakan.**
+5. Memasang service systemd `o1-launch-bot` yang hidup otomatis saat boot dan restart sendiri kalau crash.
+
+Tidak ada port yang perlu dibuka (bot hanya melakukan koneksi keluar).
+
+| Perlu apa | Perintah |
+| --- | --- |
+| Lihat status | `systemctl status o1-launch-bot` |
+| Lihat log | `journalctl -u o1-launch-bot -f` |
+| Ubah `.env` | `sudo nano /opt/o1launchtele/.env && sudo systemctl restart o1-launch-bot` |
+| Perbarui bot | `cd o1Launchtele && git pull && sudo bash scripts/setup-vps.sh` (rahasia tidak ditanya lagi) |
+| Isi ulang rahasia | `sudo bash scripts/setup-vps.sh --reconfigure` |
+| Hapus service | `sudo bash scripts/setup-vps.sh --uninstall` (`.env` dan data tetap ada) |
+
+Tidak tahu Telegram ID-mu? Kirim pesan ke `@userinfobot`. Atau isi sembarang angka (mis. `1`), jalankan bot, kirim `/id`
+ke bot, lalu ganti `ALLOWED_USER_IDS` di `.env` dan restart.
+
+Saat pembaruan, service dihentikan dulu supaya build tidak berbenturan dengan proses yang berjalan. Jangan memperbarui
+saat sebuah launch sedang berlangsung.
+
+### Manual (PC atau HP dengan Termux)
+
+```bash
+git clone https://github.com/fdlr28/o1Launchtele.git
 cd o1Launchtele
 npm install
 cp .env.example .env      # isi minimal TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, PRIVATE_KEY, O1_API_KEY
@@ -56,25 +97,18 @@ npm run doctor            # cek semua persiapan (tidak mengirim transaksi apa pu
 npm start
 ```
 
-**`npm run doctor`** memeriksa: format `.env`, token Telegram, RPC tiap chain (chain id harus cocok) beserta saldo
-wallet, API key o1 (`config:read` dan `tokens:read`), dan apakah launch Tax/Standard tersedia di tiap chain
-(jumlah pair dan creation fee). Hasilnya tidak memuat nilai rahasia, jadi aman ditempel kalau kamu butuh bantuan.
-Scope `launches:prepare`, `swaps:quote`, dan `swaps:prepare` tidak bisa dicek tanpa efek samping, jadi pastikan sendiri
-key-mu punya ketiganya.
+Di Termux: `pkg install nodejs git`, lalu langkah di atas, dan aktifkan `termux-wake-lock` supaya proses tidak dimatikan
+saat layar padam. VPS lebih andal untuk pemakaian rutin. Untuk pengembangan: `npm run dev` (auto-reload).
 
-Untuk pengembangan: `npm run dev` (auto-reload). Agar tetap hidup di server, jalankan dengan `pm2`, `systemd`, atau
-sejenisnya. Bot memakai long-polling, jadi tidak perlu domain atau webhook.
+### `npm run doctor`
 
-**Di HP (Termux):** `pkg install nodejs git`, lalu ikuti langkah di atas. Aktifkan `termux-wake-lock` supaya proses tidak
-dimatikan saat layar padam. VPS kecil lebih andal untuk pemakaian rutin.
+Memeriksa: format `.env`, token Telegram, RPC tiap chain (chain id harus cocok) beserta saldo wallet, API key o1
+(`config:read` dan `tokens:read`), dan apakah launch Tax/Standard tersedia di tiap chain (jumlah pair dan creation fee).
+Hasilnya tidak memuat nilai rahasia, jadi aman ditempel kalau kamu butuh bantuan. Scope `launches:prepare`,
+`swaps:quote`, dan `swaps:prepare` tidak bisa dicek tanpa efek samping, jadi pastikan sendiri key-mu punya ketiganya.
 
-**Tidak tahu Telegram ID-mu?** Isi `ALLOWED_USER_IDS` dengan angka apa pun (mis. `1`), jalankan bot, kirim `/id` ke bot
-(perintah ini boleh dipakai siapa saja), lalu isi ID yang muncul dan restart.
-
-Saat start, bot memeriksa: konfigurasi `.env`, RPC tiap chain (chain id harus cocok, kalau tidak chain itu
-dinonaktifkan), dan API key o1.
-
-**Memperbarui:** `git pull && npm install && npm run build`, lalu restart bot.
+Saat start, bot juga memeriksa konfigurasi `.env`, RPC tiap chain (chain id harus cocok, kalau tidak chain itu
+dinonaktifkan), dan API key o1. Bot memakai long-polling, jadi tidak perlu domain atau webhook.
 
 ## Cara pakai
 
@@ -165,14 +199,17 @@ Kalau dev buy gagal, launch-nya tetap sukses dan bot memberitahumu.
 ## Pengembangan
 
 ```bash
-npm run typecheck   # tsc --noEmit
-npm test            # vitest
+npm run typecheck        # tsc --noEmit
+npm test                 # vitest (cepat, tanpa jaringan)
+npm run test:installer   # tambahan: jalankan installer VPS sungguhan (butuh npm registry dan nodejs.org)
 ```
 
 ```
 src/
   index.ts            # entry: config, verifikasi RPC + API key, start bot
   doctor.ts           # pemeriksaan setup (npm run doctor); doctorCli.ts = entry CLI-nya
+scripts/
+  setup-vps.sh        # installer/updater VPS: Node, user, .env, build, doctor, systemd
   config.ts           # validasi .env (semua error sekaligus)
   chains.ts           # daftar chain, RPC/explorer bawaan
   logger.ts           # log dengan sensor rahasia
