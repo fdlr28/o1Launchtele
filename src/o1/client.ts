@@ -59,6 +59,9 @@ interface RequestOptions {
 
 const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+/** No legitimate response of this API comes anywhere near this; a bigger one is a misconfigured or hostile endpoint. */
+const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+
 export class O1Client implements O1Api {
   private readonly baseUrl: string;
   private readonly fetchFn: typeof fetch;
@@ -141,6 +144,8 @@ export class O1Client implements O1Api {
           method,
           headers,
           body: payload,
+          // Custom headers survive a cross-origin redirect, so an x-api-key must never be sent along one.
+          redirect: 'manual',
           signal: AbortSignal.timeout(opts.timeoutMs ?? 20_000),
         });
       } catch (err) {
@@ -152,7 +157,32 @@ export class O1Client implements O1Api {
         throw new ApiError(0, 'network_error', `Tidak bisa terhubung ke API o1: ${errorText(err)}`);
       }
 
-      const text = await res.text();
+      if (res.status >= 300 && res.status < 400) {
+        throw new ApiError(
+          res.status,
+          'unexpected_redirect',
+          'API o1 mengarahkan permintaan ke alamat lain. Ditolak agar API key tidak terkirim ke tempat yang salah; periksa O1_API_BASE_URL.',
+        );
+      }
+      const declaredLength = Number(res.headers.get('content-length'));
+      if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
+        throw new ApiError(res.status, 'response_too_large', 'Respons API o1 terlalu besar; ditolak.');
+      }
+
+      let text: string;
+      try {
+        text = await res.text();
+      } catch (err) {
+        // The connection broke (or the timeout fired) while the body was still arriving. Every call here is safe
+        // to repeat: reads, quotes and plans, and the launch preparation carries its idempotency key.
+        if (attempt < maxAttempts - 2) {
+          this.opts.log?.warn(`o1 API response body lost on ${method} ${path} (attempt ${attempt}): ${errorText(err)}`);
+          await this.sleep(backoffMs(attempt));
+          continue;
+        }
+        throw new ApiError(0, 'network_error', `Respons API o1 terputus sebelum selesai dibaca: ${errorText(err)}`);
+      }
+      if (text.length > MAX_RESPONSE_BYTES) throw new ApiError(res.status, 'response_too_large', 'Respons API o1 terlalu besar; ditolak.');
       let json: unknown;
       try {
         json = text ? JSON.parse(text) : undefined;

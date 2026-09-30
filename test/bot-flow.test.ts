@@ -1,7 +1,9 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ApiError } from '../src/o1/client.js';
 import { OWNER, PNG_BYTES, STRANGER, createHarness, type Harness } from './bot-harness.js';
-import { AAPL, ROUTER, TOKEN, TOKENS_10K, USDC, WALLET, ZERO, RECIPIENT } from './fixtures.js';
+import { AAPL, ROUTER, TOKEN, TOKENS_10K, USDC, WALLET, ZERO, RECIPIENT, addr, configFor, quote } from './fixtures.js';
 
 let h: Harness;
 
@@ -14,6 +16,17 @@ beforeEach(() => {
 afterEach(() => {
   if (!h.allowErrors) expect(h.errors).toEqual([]);
 });
+
+/** A launch that was sent earlier and never settled, as left behind by a crash. */
+function seedPendingLaunch(hash = `0x${'a1'.repeat(32)}`, status: 'sent' | 'unknown' = 'unknown') {
+  mkdirSync(h.dataDir, { recursive: true });
+  writeFileSync(
+    join(h.dataDir, 'launches.jsonl'),
+    JSON.stringify({ ts: new Date().toISOString(), kind: 'launch', status, chainId: 8453, name: 'Old Coin', symbol: 'OLD', txHash: hash }) + '\n',
+  );
+  h.wallet.statuses.set(hash as `0x${string}`, 'pending');
+  return hash;
+}
 
 /** /launch, then name + symbol + image. */
 async function fillBasics() {
@@ -430,7 +443,7 @@ describe('review', () => {
     expect(h.panelText()).toContain('Semua cek lolos');
     expect(h.panelText()).toContain('Creation fee: 0.001 ETH');
     expect(h.hasButton('go:launch')).toBe(true);
-    expect(h.state().reviewedFeeRaw).toBe(1_000_000_000_000_000n);
+    expect(h.state().reviewed?.fee).toEqual({ currency: ZERO, amountRaw: 1_000_000_000_000_000n });
   });
 
   it('blocks on insufficient balance', async () => {
@@ -458,6 +471,64 @@ describe('review', () => {
     await h.press('tog:dev');
     await h.press('nav:review');
     expect(h.panelText()).toContain('Jumlah dev buy belum diisi');
+  });
+
+  it('blocks while an earlier launch is still unresolved', async () => {
+    seedPendingLaunch();
+    await fillBasics();
+    await h.press('nav:review');
+    expect(h.panelText()).toContain('Ada launch sebelumnya yang hasilnya belum jelas');
+    expect(h.panelText()).toContain('/dismiss ya');
+    expect(h.hasButton('go:launch')).toBe(false);
+    expect(h.state().reviewed).toBeNull();
+  });
+
+  it('checks the balance of an ERC-20 creation fee, and remembers its currency', async () => {
+    const cfg = configFor('tax');
+    cfg.suites![0]!.creation_fee = { amount_raw: '5000000', currency: USDC, symbol: 'USDC', decimals: 6 };
+    h.api.configs.tax = cfg;
+    await fillBasics();
+    h.wallet.quoteBalance = 4_000_000n;
+    await h.press('nav:review');
+    expect(h.panelText()).toContain('Saldo USDC kurang');
+    expect(h.hasButton('go:launch')).toBe(false);
+
+    h.wallet.quoteBalance = 6_000_000n;
+    await h.press('nav:review');
+    expect(h.panelText()).toContain('Creation fee: 5 USDC');
+    expect(h.panelText()).toContain('Saldo USDC: 6 (butuh 5)');
+    expect(h.hasButton('go:launch')).toBe(true);
+    expect(h.state().reviewed?.fee).toEqual({ currency: USDC, amountRaw: 5_000_000n });
+  });
+
+  it('a review only counts for the draft it was made for', async () => {
+    await fillBasics();
+    await h.press('nav:review');
+    expect(h.state().reviewed).not.toBeNull();
+
+    h.state().draft!.name = 'Something Else'; // edited after the review
+    await h.press('go:launch');
+    expect(h.alerts().at(-1)).toContain('Draft berubah sejak Review');
+    expect(h.wallet.sent).toHaveLength(0);
+    expect(h.state().reviewed).toBeNull();
+    expect(h.launcher.isBusy()).toBe(false);
+  });
+
+  it('escapes hostile pair symbols in every view that shows them', async () => {
+    const cfg = configFor('tax');
+    const hostile = addr(0x9009);
+    cfg.quotes!.push(quote(cfg.suites![0]!.id, hostile, '<i>&EVIL', { asset_type: 'crypto_token', name: '<b>Evil' }));
+    h.api.configs.tax = cfg;
+    await fillBasics();
+    await h.press('nav:pair');
+    await h.press(`pair:pick:${hostile}`);
+    await h.press('nav:dev');
+    await h.press('tog:dev');
+    await h.press('in:devAmount:dev');
+    await h.text('1');
+    expect(h.panelText()).toContain('&lt;i&gt;&amp;EVIL');
+    await h.press('nav:review'); // the harness lints every outgoing message: an unescaped symbol would fail the test
+    expect(h.panelText()).toContain('&lt;i&gt;&amp;EVIL');
   });
 
   it('flags an invalid tax setup coming from the chain policy', async () => {
@@ -611,6 +682,36 @@ describe('launching', () => {
     expect(h.panelText()).toContain('https://basescan.org/tx/');
   });
 
+  it('needs a fresh review after every attempt, successful or not', async () => {
+    h.wallet.receipts = ['reverted'];
+    await fillBasics();
+    await h.press('nav:review');
+    await h.press('go:launch');
+    await h.settled();
+    expect(h.panelText()).toContain('Launch gagal');
+    expect(h.state().reviewed).toBeNull();
+    await h.press('go:launch');
+    expect(h.alerts().at(-1)).toContain('Review');
+    expect(h.wallet.broadcasts).toHaveLength(1);
+  });
+
+  it('an unconfirmed launch blocks the next one and points to /dismiss', async () => {
+    h.wallet.receipts = ['timeout'];
+    await fillBasics();
+    await h.press('nav:review');
+    await h.press('go:launch');
+    await h.settled();
+    expect(h.panelText()).toContain('Launch gagal');
+    const hash = h.wallet.sent[0]!.hash;
+    expect(h.panelText()).toContain(hash);
+    h.wallet.statuses.set(hash, 'pending');
+
+    await h.press('nav:dash');
+    await h.press('nav:review');
+    expect(h.panelText()).toContain('Ada launch sebelumnya yang hasilnya belum jelas');
+    expect(h.hasButton('go:launch')).toBe(false);
+  });
+
   it('will not launch before the review, or when the draft became invalid', async () => {
     await fillBasics();
     await h.press('go:launch'); // from the dashboard, not the review panel
@@ -638,6 +739,60 @@ describe('other commands', () => {
     const text = h.sentTexts().at(-1)!;
     expect(text).toContain('Pepe Coin');
     expect(text).toContain(TOKEN);
+  });
+
+  describe('/dismiss', () => {
+    it('says so when nothing is pending', async () => {
+      await h.command('dismiss');
+      expect(h.sentTexts().at(-1)).toContain('Tidak ada launch yang tertunda');
+    });
+
+    it('lists the pending launch first, and only forgets it after an explicit "ya"', async () => {
+      const hash = seedPendingLaunch();
+      await h.command('dismiss');
+      let text = h.sentTexts().at(-1)!;
+      expect(text).toContain('Launch tertunda');
+      expect(text).toContain('Old Coin');
+      expect(text).toContain(`https://basescan.org/tx/${hash}`);
+      expect(text).toContain('/dismiss ya');
+      expect((await h.launcher.pendingLaunches()).length).toBe(1);
+
+      await h.command('dismiss', OWNER, 'private', 'tidak');
+      expect((await h.launcher.pendingLaunches()).length).toBe(1);
+
+      await h.command('dismiss', OWNER, 'private', 'ya');
+      text = h.sentTexts().at(-1)!;
+      expect(text).toContain('Diabaikan: 1');
+      expect(await h.launcher.pendingLaunches()).toEqual([]);
+
+      await fillBasics();
+      await h.press('nav:review');
+      expect(h.hasButton('go:launch')).toBe(true);
+    });
+
+    it('is refused while a launch is running', async () => {
+      await fillBasics();
+      await h.press('nav:review');
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const original = h.api.prepareLaunch.bind(h.api);
+      h.api.prepareLaunch = async (body, key) => {
+        await gate;
+        return original(body, key);
+      };
+      await h.press('go:launch');
+      await h.command('dismiss', OWNER, 'private', 'ya');
+      expect(h.sentTexts().at(-1)).toContain('Launch sedang berjalan');
+      release();
+      await h.settled();
+    });
+
+    it('is not available to strangers', async () => {
+      seedPendingLaunch();
+      await h.command('dismiss', STRANGER, 'private', 'ya');
+      expect(h.sentTexts().at(-1)).toContain('Akses ditolak');
+      expect((await h.launcher.pendingLaunches()).length).toBe(1);
+    });
   });
 
   it('/start explains the bot without leaking secrets', async () => {

@@ -83,7 +83,8 @@ export class MockTelegram {
           return json(res, 200, { ok: true, result: { id: 1, is_bot: true, first_name: 'Bot', username: 'e2e_bot', can_join_groups: false, can_read_all_group_messages: false, supports_inline_queries: false } });
         case 'sendMessage': {
           const id = this.nextMessageId++;
-          this.lastPanelId = id;
+          // The control panel is the message with the inline keyboard; plain replies (/dismiss, /wallet...) are not.
+          if (payload.reply_markup) this.lastPanelId = id;
           return json(res, 200, { ok: true, result: { message_id: id, date: 0, chat: { id: payload.chat_id, type: 'private' }, text: payload.text } });
         }
         case 'getFile':
@@ -133,6 +134,8 @@ export class MockO1 {
   bodies: Array<Record<string, any>> = []; // eslint-disable-line @typescript-eslint/no-explicit-any
   headers: Array<IncomingMessage['headers']> = [];
   configHits = 0;
+  /** Delays every /launches/prepare response (the real API uploads to IPFS and mines an address). */
+  prepareDelayMs = 0;
   private server!: Server;
   private validate = (() => {
     const addFormats = ((addFormatsModule as unknown as { default?: unknown }).default ?? addFormatsModule) as (a: Ajv2020) => void;
@@ -159,6 +162,7 @@ export class MockO1 {
         const body = JSON.parse(await readBody(req));
         this.bodies.push(body);
         this.headers.push(req.headers);
+        if (this.prepareDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, this.prepareDelayMs));
         if (!this.validate(body)) {
           return json(res, 400, { status: 400, code: 'invalid_request', title: 'Invalid', detail: JSON.stringify(this.validate.errors), request_id: 'req_e2e' }, 'application/problem+json');
         }

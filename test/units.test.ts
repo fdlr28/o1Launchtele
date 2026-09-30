@@ -55,6 +55,37 @@ describe('parseAssetAmount', () => {
   });
 });
 
+describe('ambiguous thousands separators', () => {
+  it('refuses to guess between "1.000 = one thousand" and "1.000 = one"', () => {
+    for (const bad of ['1.000', '1,000', '10.000', '10,000', '250,500', '999.999', ' 1 .000 ']) {
+      expect(() => parseAssetAmount(bad, 18), bad).toThrow(/ambigu/);
+      expect(() => parseTokenAmount(bad), bad).toThrow(/ambigu/);
+    }
+  });
+
+  it('says how to write it unambiguously', () => {
+    expect(() => parseAssetAmount('1.500', 18)).toThrow(/Tulis 1500 untuk ribuan, atau 1.5000 untuk desimal/);
+    expect(() => parseTokenAmount('10,000')).toThrow(/Tulis 10000 untuk ribuan, atau 10.0000 untuk desimal/);
+  });
+
+  it('still accepts everything that can only mean one thing', () => {
+    expect(parseAssetAmount('0.005', 18)).toBe(5_000_000_000_000_000n); // a leading zero cannot be a thousands group
+    expect(parseAssetAmount('0,050', 18)).toBe(50_000_000_000_000_000n);
+    expect(parseAssetAmount('1.5', 18)).toBe(1_500_000_000_000_000_000n);
+    expect(parseAssetAmount('1.50', 6)).toBe(1_500_000n);
+    expect(parseAssetAmount('1.5000', 18)).toBe(1_500_000_000_000_000_000n);
+    expect(parseAssetAmount('1500', 6)).toBe(1_500_000_000n);
+    expect(parseAssetAmount('12.34567', 18)).toBe(12_345_670_000_000_000_000n);
+    expect(parseTokenAmount('10000')).toBe(10_000n * 10n ** 18n);
+    expect(parseTokenAmount('1.000k')).toBe(1_000n * 10n ** 18n); // a suffix leaves no doubt
+    expect(parseTokenAmount('0.001')).toBe(10n ** 15n);
+  });
+
+  it('does not touch percentages', () => {
+    expect(parsePercent('1.000')).toBe(1_000_000n);
+  });
+});
+
 describe('parseTokenAmount', () => {
   it('handles plain numbers and k / m / b suffixes exactly', () => {
     const ten = 10n ** 18n;

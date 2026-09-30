@@ -15,9 +15,10 @@ const PROGRESS_EDIT_INTERVAL_MS = 1100;
 export async function startLaunch(target: Target, deps: BotDeps, ui: Ui): Promise<void> {
   const { state } = target;
   const draft = state.draft;
-  if (!draft) return;
+  const reviewed = state.reviewed;
+  if (!draft || !reviewed) return;
 
-  const job: LaunchJob = { draft: structuredClone(draft), reviewedFeeRaw: state.reviewedFeeRaw ?? 0n };
+  const job: LaunchJob = { draft: structuredClone(draft), reviewedFee: reviewed.fee };
   const explorer = ui.explorer(draft.chainId);
   const events: ProgressEvent[] = [];
 
@@ -31,7 +32,7 @@ export async function startLaunch(target: Target, deps: BotDeps, ui: Ui): Promis
     deps.log.warn('could not render the initial progress panel', err);
   }
 
-  void runInBackground();
+  void deps.tasks.track(runInBackground());
 
   async function runInBackground(): Promise<void> {
     let timer: NodeJS.Timeout | null = null;
@@ -63,12 +64,12 @@ export async function startLaunch(target: Target, deps: BotDeps, ui: Ui): Promis
     }
     if (timer) clearTimeout(timer);
     state.launching = false;
+    state.reviewed = null; // whatever happened, the next attempt needs a fresh review
 
     try {
       if (outcome) {
         state.lastDraft = job.draft;
         state.draft = null;
-        state.reviewedFeeRaw = null;
         await ui.finish(target, {
           text: resultText(job.draft, outcome, ui.chainName(job.draft.chainId), explorer),
           keyboard: resultKeyboard(),

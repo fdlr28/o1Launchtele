@@ -122,7 +122,8 @@ Kirim `/launch`. Muncul satu panel dengan tombol; semua tampilan mengedit panel 
 4. **Dev Buy** (opsional).
 5. **Review & Launch**: bot memvalidasi semuanya, mengecek saldo, dan menampilkan fee. Tekan **Konfirmasi & Launch**.
 
-Perintah lain: `/wallet` (alamat dan saldo), `/history` (launch terakhir), `/cancel`, `/help`, `/id`.
+Perintah lain: `/wallet` (alamat dan saldo), `/history` (launch terakhir), `/dismiss` (lihat bagian
+[Launch tertunda](#launch-tertunda)), `/cancel`, `/help`, `/id`.
 Setelah launch, **Launch lagi** membuka draft baru yang mewarisi chain, pair, tax, sosial, dan dev buy
 (nama, simbol, gambar, dan deskripsi harus diisi ulang).
 
@@ -161,18 +162,54 @@ Kalau dev buy gagal, launch-nya tetap sukses dan bot memberitahumu.
 - **Hot wallet.** `PRIVATE_KEY` ada di `.env` server. Pakai wallet khusus berisi dana secukupnya. Jangan pernah commit
   `.env` (sudah di `.gitignore`), dan jangan bagikan isinya.
 - **Whitelist.** Hanya user di `ALLOWED_USER_IDS` yang bisa memakai bot, dan hanya di chat pribadi (grup diabaikan).
-- **Bot tidak menandatangani sembarangan.** Sebelum menandatangani transaksi apa pun dari API, bot memastikan:
-  chain benar, pengirim adalah wallet bot, tujuan adalah kontrak o1 yang dikenal dari `/config` (atau token pair untuk
-  `approve`), `value` tidak melebihi fee yang kamu setujui di Review, token ERC-20 hanya menerima `approve`, dan
-  tanda tangan Permit2 hanya untuk pair dan spender yang cocok. `STRICT_TARGETS=false` melonggarkan hanya daftar
-  kontrak tujuan.
+- **Bot tidak menandatangani sembarangan.** Respons API o1 tidak dipercaya begitu saja: dana yang bisa keluar dibatasi
+  ke tujuan, jenis panggilan, dan jumlah yang kamu setujui. Seluruh rencana transaksi diperiksa **sebelum satu pun
+  ditandatangani**:
+  - chain benar dan pengirim adalah wallet bot; maksimal 4 langkah, hanya langkah terakhir yang boleh berupa panggilan;
+  - panggilan hanya boleh ke kontrak yang tepat untuk langkahnya: *factory* untuk launch, *router* untuk swap. Permit2,
+    escrow, hook, dan kontrak lain tidak pernah boleh dipanggil;
+  - token ERC-20 (pair atau token fee) hanya menerima `approve`, ke spender yang dikenal, dengan jumlah tidak lebih dari
+    fee/dev buy yang kamu setujui (Permit2 satu-satunya yang boleh menerima allowance tak terbatas, karena hanya bisa
+    memakai apa yang diizinkan permit terpisah);
+  - total `value` semua langkah tidak melebihi fee (atau jumlah dev buy) yang kamu setujui di Review;
+  - tanda tangan Permit2 hanya untuk pair yang dipilih, router sebagai spender, jumlah tidak melebihi dev buy, allowance
+    maksimal 31 hari dan tanda tangan maksimal 24 jam.
+
+  Kontrak dikenali dari `/config` o1 untuk chain yang dipilih. Pemeriksaan ini **tidak bisa dimatikan**; kontrak tambahan
+  yang sudah kamu verifikasi sendiri bisa didaftarkan di `EXTRA_ALLOWED_TARGETS` (kosong secara bawaan).
+- **Review terikat ke drafnya.** Konfirmasi hanya berlaku untuk draf yang persis sama dengan yang di-review; kalau ada yang
+  diubah sesudahnya, kamu diminta Review ulang. Setiap upaya launch (sukses atau gagal) juga butuh Review baru.
+- **Fee dijaga.** Jika fee launch (jumlah *atau* mata uangnya) berubah naik sesudah Review, launch dibatalkan.
+- **Rencana kedaluwarsa tidak ditandatangani.** Umur rencana dihitung dari cap waktu API (bukan jam server-mu); rencana
+  yang tinggal beberapa detik disiapkan ulang, dan rencana tanpa waktu kedaluwarsa yang valid ditolak.
 - **Chain id RPC diverifikasi** saat start (viem tidak melakukannya sendiri untuk akun lokal).
-- **Fee dijaga.** Jika fee launch naik sesudah Review, launch dibatalkan dan kamu diminta Review ulang.
-- **Log bersih.** Private key, API key, dan token bot disensor dari log (termasuk di URL). Hash transaksi tetap terlihat.
-- **Tidak ada resend buta.** Hash transaksi dicatat ke `data/launches.jsonl` *sebelum* menunggu receipt. Kalau receipt
-  tidak datang tepat waktu, bot memberi tahu bahwa transaksi terkirim tetapi belum terkonfirmasi, meminta kamu mengecek
-  hash di explorer, dan tidak mengirim ulang.
+- **Hanya koneksi aman.** Semua URL (RPC, API o1, Telegram, explorer) harus `https://`; `http://` hanya untuk
+  localhost. Redirect dari API o1 ditolak supaya API key tidak ikut terkirim ke tempat lain.
+- **Log dan pesan bersih.** Private key, API key, token bot, dan kunci di dalam URL RPC disensor dari log **dan** dari
+  pesan error yang dikirim ke Telegram. Hash transaksi tetap terlihat.
+- **Tidak ada resend buta, tidak ada dobel.** Transaksi ditandatangani lebih dulu, hash-nya **ditulis ke
+  `data/launches.jsonl` sebelum dikirim** (kalau tidak bisa ditulis, transaksi tidak dikirim), lalu dikirim tepat satu kali
+  tanpa retry tersembunyi. Kalau jawaban node hilang, bot mencari hash itu di chain dan tidak pernah mengirim ulang.
+- **Launch tertunda memblokir launch baru** sampai jelas hasilnya (lihat di bawah).
+- **Berhenti dengan rapi.** Saat service dihentikan (`systemctl stop/restart`), bot berhenti menerima perintah baru,
+  menunggu launch yang sedang berjalan sampai selesai (maks 2 menit), dan mengirim pesan hasilnya sebelum keluar.
 - Jika API key atau token bot bocor: cabut/buat ulang dari sumbernya. Jika private key bocor: pindahkan dana segera.
+
+### Launch tertunda
+
+Kalau transaksi launch terkirim tetapi hasilnya tidak jelas (receipt tidak datang, jawaban node hilang, atau bot mati di
+tengah jalan), bot **memblokir launch baru** supaya tidak terjadi launch dobel, dan memberi tahu kamu (termasuk saat bot
+menyala kembali). Yang perlu kamu lakukan:
+
+1. Buka hash transaksinya di explorer (ada di pesan bot dan di `/dismiss`).
+2. Kalau **berhasil**, tidak perlu apa-apa: bot menyelesaikannya sendiri begitu chain melaporkannya.
+3. Kalau **tidak akan pernah terkonfirmasi** (hilang dari mempool), kirim `/dismiss ya`. Transaksi yang tidak dikenal chain
+   selama 30 menit juga dianggap gugur otomatis.
+
+Jangan gunakan `/dismiss ya` kalau transaksinya mungkin masih akan masuk: itu bisa menyebabkan launch dobel.
+
+Angka yang ambigu ditolak: `1.000` atau `1,000` bisa berarti satu atau seribu, jadi bot minta kamu menulis `1000` (ribuan)
+atau `1.0000` (desimal).
 
 ## Batasan yang perlu kamu tahu
 
@@ -180,6 +217,11 @@ Kalau dev buy gagal, launch-nya tetap sukses dan bot memberitahumu.
   Bila terkena, bot menunggu otomatis sesuai `Retry-After` (sampai 90 detik).
 - **Satu launch dalam satu waktu** (satu wallet = satu aliran nonce).
 - **Draft disimpan di memori**: hilang jika bot restart. Launch yang sudah dikirim tetap tercatat di `/history`.
+- **Isi calldata tidak didekode.** Bot menjaga *ke mana*, *jenis panggilan*, dan *berapa dana* yang keluar, tetapi tidak
+  bisa membaca parameter token di dalam calldata `createLaunch` (nama, tax, penerima fee): itu dibuat API o1 dari
+  permintaanmu. Setelah launch, cek tokennya di explorer / launch.o1.exchange, terutama untuk launch pertama.
+- **Dev buy dibatasi** ke jumlah yang kamu setujui: allowance/permit yang diminta API lebih besar dari itu (mis. allowance
+  Permit2 lebih dari 31 hari) ditolak, dan dev buy-nya dilaporkan gagal (launch-nya tetap sukses).
 - **Tanpa atomic dev buy** (lihat di atas) dan tanpa klaim fee di bot (klaim lewat web o1).
 - Supply tetap 1 miliar token dan likuiditas terkunci permanen; itu aturan kontrak o1, bukan bot.
 
@@ -192,7 +234,11 @@ Kalau dev buy gagal, launch-nya tetap sukses dan bot memberitahumu.
 | `API key o1 ditolak` | Key salah/dicabut, atau kurang scope (lihat daftar scope di atas). |
 | Chain tidak muncul di tombol Chain | RPC-nya belum diisi atau gagal verifikasi (lihat log start). |
 | `Pair … tidak tersedia` | Registrasi pair berubah di sisi o1; pilih pair lain. |
-| `Transaksi … ditolak demi keamanan` | Respons API tidak cocok dengan konfigurasi o1 (mis. router tak dikenal). Jangan dilewati begitu saja; bila yakin, coba `STRICT_TARGETS=false`. |
+| `Transaksi … ditolak demi keamanan` | Respons API tidak cocok dengan konfigurasi o1 (mis. kontrak tak dikenal, approve terlalu besar). Jangan dilewati begitu saja. Hanya bila kamu sudah memverifikasi sendiri kontraknya, daftarkan di `EXTRA_ALLOWED_TARGETS`. |
+| `Ada launch sebelumnya yang hasilnya belum jelas` | Lihat [Launch tertunda](#launch-tertunda). |
+| `Draft berubah sejak Review` | Ada yang diubah setelah Review. Buka Review lagi lalu konfirmasi. |
+| `… harus URL https://` | Semua URL harus `https://` (atau `http://localhost`). Perbaiki di `.env`. |
+| `STRICT_TARGETS sudah dihapus` | Opsi untuk mematikan pemeriksaan target sudah dihapus (selalu aktif). Hapus barisnya dari `.env`. |
 | `Estimasi gas gagal` | Transaksi akan revert (deadline habis, fee berubah, saldo kurang). Coba Review ulang. |
 | Dev buy: `Token belum terindeks` | API o1 belum mengindeks token; beli manual di launch.o1.exchange. |
 
@@ -205,19 +251,19 @@ npm run test:installer   # tambahan: jalankan installer VPS sungguhan (butuh npm
 ```
 
 ```
-src/
-  index.ts            # entry: config, verifikasi RPC + API key, start bot
-  doctor.ts           # pemeriksaan setup (npm run doctor); doctorCli.ts = entry CLI-nya
 scripts/
   setup-vps.sh        # installer/updater VPS: Node, user, .env, build, doctor, systemd
+src/
+  index.ts            # entry: config, verifikasi RPC + API key, start bot, shutdown rapi
+  doctor.ts           # pemeriksaan setup (npm run doctor); doctorCli.ts = entry CLI-nya
   config.ts           # validasi .env (semua error sekaligus)
   chains.ts           # daftar chain, RPC/explorer bawaan
   logger.ts           # log dengan sensor rahasia
   errors.ts           # pesan error ramah user
   domain/             # murni, tanpa I/O: satuan & persen eksak, validator, tax, draft, waktu dev buy
   o1/                 # klien API o1, katalog /config (cache), builder request, helper swap
-  wallet/             # viem: verifikasi chain id, estimasi gas, tanda tangan, receipt
-  services/           # launcher (pipeline), guard (keamanan tx), review, riwayat JSONL
+  wallet/             # viem: verifikasi chain id, estimasi gas, tanda tangan lokal, broadcast sekali, status hash
+  services/           # launcher (pipeline), guard (keamanan tx), review, riwayat JSONL (write-ahead)
   bot/                # grammY: panel, keyboard, teks, input, callback, perintah, launch di background
 test/                 # unit + alur bot + end-to-end proses nyata (lihat di bawah)
 ```

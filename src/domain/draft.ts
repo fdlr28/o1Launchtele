@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Address } from 'viem';
 import type { AssetType, Product, Route } from '../o1/types.js';
 import { defaultTaxSettings, type TaxSettings } from './tax.js';
@@ -84,6 +84,27 @@ export function carryOverDraft(previous: Draft): Draft {
     image: null,
     description: '',
   };
+}
+
+/** JSON with sorted keys, so equal drafts always serialise to the same text. */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, v]) => v !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+    return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(',')}}`;
+  }
+  return JSON.stringify(typeof value === 'bigint' ? value.toString() : value) ?? 'null';
+}
+
+/**
+ * Digest of everything that ends up in a launch. A review is only valid for the draft state it was made
+ * for: if anything changes afterwards, the fingerprint differs and the owner has to review again.
+ */
+export function draftFingerprint(draft: Draft): string {
+  const image = draft.image ? { type: draft.image.type, bytes: draft.image.bytes, sha256: createHash('sha256').update(draft.image.base64).digest('hex') } : null;
+  return createHash('sha256').update(canonical({ ...draft, image })).digest('hex');
 }
 
 /** Required fields that are still empty, in Indonesian, for the review screen. */

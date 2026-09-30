@@ -17,7 +17,10 @@ export interface HistoryEntry {
   note?: string;
 }
 
-/** Append-only JSONL log of everything the bot sent on chain (written before waiting for receipts). */
+/**
+ * Append-only JSONL log of everything the bot sent on chain. A transaction is logged as "sent" BEFORE it
+ * is broadcast, so a crash or a lost reply can never leave a transaction that only the chain knows about.
+ */
 export class History {
   private readonly file: string;
 
@@ -26,13 +29,13 @@ export class History {
   }
 
   async append(entry: Omit<HistoryEntry, 'ts'>): Promise<void> {
-    await mkdir(this.dir, { recursive: true });
+    await mkdir(this.dir, { recursive: true, mode: 0o700 });
     const line: HistoryEntry = { ts: new Date().toISOString(), ...entry };
     await appendFile(this.file, JSON.stringify(line) + '\n', { mode: 0o600 });
   }
 
-  /** Latest state per transaction (a later line for the same hash overrides an earlier one). */
-  async recent(kind: HistoryEntry['kind'], limit: number): Promise<HistoryEntry[]> {
+  /** Latest state per transaction (a later line for the same hash overrides an earlier one), oldest first. */
+  private async merged(kind: HistoryEntry['kind']): Promise<HistoryEntry[]> {
     let text: string;
     try {
       text = await readFile(this.file, 'utf8');
@@ -45,11 +48,22 @@ export class History {
       try {
         const entry = JSON.parse(line) as HistoryEntry;
         if (entry.kind !== kind) continue;
-        byKey.set(`${entry.chainId}:${entry.txHash ?? entry.ts}`, { ...byKey.get(`${entry.chainId}:${entry.txHash ?? entry.ts}`), ...entry });
+        const key = `${entry.chainId}:${entry.txHash ?? entry.ts}`;
+        byKey.set(key, { ...byKey.get(key), ...entry });
       } catch {
         // ignore a corrupt line rather than losing the whole history
       }
     }
-    return [...byKey.values()].slice(-limit).reverse();
+    return [...byKey.values()];
+  }
+
+  /** Most recent transactions of a kind, newest first. */
+  async recent(kind: HistoryEntry['kind'], limit: number): Promise<HistoryEntry[]> {
+    return (await this.merged(kind)).slice(-limit).reverse();
+  }
+
+  /** Launch transactions whose outcome is still unknown: sent (or lost) and never confirmed, reverted or dismissed. */
+  async pending(): Promise<HistoryEntry[]> {
+    return (await this.merged('launch')).filter((e) => e.txHash && (e.status === 'sent' || e.status === 'unknown'));
   }
 }

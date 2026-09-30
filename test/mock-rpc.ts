@@ -24,6 +24,15 @@ export class MockRpc {
   url = '';
   revertNext = false;
   block = 100;
+  /** Every eth_sendRawTransaction request that reached the node (also failed and dropped ones). */
+  sendCalls = 0;
+  /** The node accepts the next transaction but the connection dies before the reply arrives. */
+  dropNextSendReply = false;
+  /** The next eth_sendRawTransaction is refused with a JSON-RPC error. */
+  failNextSend: { code: number; message: string } | null = null;
+  /** When false, accepted transactions stay pending (no receipt) until mine() is called. */
+  autoMine = true;
+  private readonly mined = new Set<string>();
 
   constructor(chainId: number) {
     this.chainId = chainId;
@@ -37,19 +46,42 @@ export class MockRpc {
         const payload = JSON.parse(body);
         const respond = async (call: { id: number; method: string; params?: unknown[] }) => {
           try {
-            return { jsonrpc: '2.0', id: call.id, result: await this.handle(call.method, call.params ?? []) };
+            if (call.method === 'eth_sendRawTransaction') {
+              this.sendCalls++;
+              if (this.failNextSend) {
+                const fault = this.failNextSend;
+                this.failNextSend = null;
+                return { jsonrpc: '2.0', id: call.id, error: { code: fault.code, message: fault.message } };
+              }
+            }
+            const result = await this.handle(call.method, call.params ?? []);
+            if (call.method === 'eth_sendRawTransaction' && this.dropNextSendReply) {
+              this.dropNextSendReply = false;
+              return null; // accepted, but no reply will be sent
+            }
+            return { jsonrpc: '2.0', id: call.id, result };
           } catch (err) {
             const e = err as { code?: number; message: string };
             return { jsonrpc: '2.0', id: call.id, error: { code: e.code ?? -32000, message: e.message } };
           }
         };
         const out = Array.isArray(payload) ? await Promise.all(payload.map(respond)) : await respond(payload);
+        if (out === null) {
+          req.socket.destroy();
+          return;
+        }
         res.setHeader('content-type', 'application/json');
         res.end(JSON.stringify(out));
       });
     });
     await new Promise<void>((resolve) => this.server.listen(0, '127.0.0.1', resolve));
     this.url = `http://127.0.0.1:${(this.server.address() as AddressInfo).port}`;
+  }
+
+  /** Includes every pending transaction in a block. */
+  mine(): void {
+    for (const item of this.received) this.mined.add(item.hash);
+    this.block++;
   }
 
   async stop(): Promise<void> {
@@ -114,18 +146,20 @@ export class MockRpc {
         const hash = keccak256(raw);
         this.received.push({ hash, raw, tx, from });
         this.receipts.set(hash, { blockNumber: this.block + 1, status: this.revertNext ? '0x0' : '0x1' });
+        if (this.autoMine) this.mined.add(hash);
         return hash;
       }
       case 'eth_getTransactionByHash': {
         const found = this.received.find((r) => r.hash === params[0]);
         if (!found) return null;
         const receipt = this.receipts.get(found.hash)!;
+        const isMined = this.mined.has(found.hash);
         return {
           hash: found.hash,
           nonce: toHex(found.tx.nonce ?? 0),
-          blockHash: keccak256(toHex(receipt.blockNumber)),
-          blockNumber: toHex(receipt.blockNumber),
-          transactionIndex: '0x0',
+          blockHash: isMined ? keccak256(toHex(receipt.blockNumber)) : null,
+          blockNumber: isMined ? toHex(receipt.blockNumber) : null,
+          transactionIndex: isMined ? '0x0' : null,
           from: found.from,
           to: found.tx.to,
           value: toHex(found.tx.value ?? 0n),
@@ -142,7 +176,7 @@ export class MockRpc {
       case 'eth_getTransactionReceipt': {
         const found = this.received.find((r) => r.hash === params[0]);
         const receipt = found && this.receipts.get(found.hash);
-        if (!found || !receipt) return null;
+        if (!found || !receipt || !this.mined.has(found.hash)) return null;
         return {
           transactionHash: found.hash,
           transactionIndex: '0x0',

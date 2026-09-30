@@ -19,14 +19,24 @@ export const STANDARD_ANTI_SNIPE_SECONDS: Record<number, number> = {
 
 const FALLBACK_WINDOW_SECONDS = 20;
 
+/**
+ * Upper bound on how long the bot will ever wait for the surcharge to decay. The window comes from the
+ * API, and a wrong or hostile value must not make the bot sleep for hours with the launcher locked.
+ */
+export const MAX_ANTI_SNIPE_WAIT_SECONDS = 180;
+
 /** Seconds during which a buy pays the extra anti-snipe surcharge on top of the normal fee. */
 export function antiSnipeWindowSeconds(draft: Pick<Draft, 'product' | 'chainId' | 'tax'>, suite: ContractSuite | undefined): number {
+  let window: number;
   if (draft.product === 'tax') {
     if (!draft.tax.antiSnipe) return 0;
     const policy = suite ? readTaxPolicy(suite) : null;
-    return policy?.antiSnipeWindowSeconds ?? FALLBACK_WINDOW_SECONDS;
+    window = policy?.antiSnipeWindowSeconds ?? FALLBACK_WINDOW_SECONDS;
+  } else {
+    window = STANDARD_ANTI_SNIPE_SECONDS[draft.chainId] ?? FALLBACK_WINDOW_SECONDS;
   }
-  return STANDARD_ANTI_SNIPE_SECONDS[draft.chainId] ?? FALLBACK_WINDOW_SECONDS;
+  if (!Number.isFinite(window) || window < 0) return FALLBACK_WINDOW_SECONDS;
+  return Math.min(window, MAX_ANTI_SNIPE_WAIT_SECONDS);
 }
 
 /** Extra seconds added after the window so the surcharge has fully decayed when we buy. */

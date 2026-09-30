@@ -73,6 +73,11 @@ describe('setup-vps.sh: static checks', () => {
       ['valid_api_key', 'sk-123', false],
       ['valid_url', 'https://base-mainnet.g.alchemy.com/v2/AbC123', true],
       ['valid_url', 'http://127.0.0.1:8545', true],
+      ['valid_url', 'http://localhost:8545/rpc', true],
+      ['valid_url', 'http://[::1]:8545', true],
+      ['valid_url', 'http://rpc.example.com', false], // plain http to another machine
+      ['valid_url', 'http://127.0.0.1.evil.com', false],
+      ['valid_url', 'http://localhost:80@evil.com', false], // userinfo trick
       ['valid_url', 'https://x.test/a b', false],
       ['valid_url', 'https://x.test/#frag', false],
       ['valid_url', 'https://x.test/$HOME', false],
@@ -130,6 +135,8 @@ describe('setup-vps.sh: functions', () => {
       'PrivateTmp=true',
       'UMask=0077',
       'StartLimitBurst=5',
+      // The bot waits up to 120 s for a running launch on SIGTERM; systemd must not kill it sooner.
+      'TimeoutStopSec=150',
       'WantedBy=multi-user.target',
     ]) expect(text, line).toContain(line);
     expect(text).toMatch(/ExecStart=\/\S*node dist\/index\.js/);
@@ -182,12 +189,12 @@ describe('setup-vps.sh: functions', () => {
       O1_SETUP_PRIVATE_KEY: PRIVATE_KEY,
       O1_SETUP_O1_API_KEY: API_KEY,
     };
-    const ok = sh('configure_env; echo "presets left: $(compgen -v O1_SETUP_ | wc -l)"; echo "key var: ${PRIVATE_KEY:-unset}"', { ...preset, O1_SETUP_CHAINS: '8453,56', O1_SETUP_RPC_URL_8453: 'http://rpc.test' });
+    const ok = sh('configure_env; echo "presets left: $(compgen -v O1_SETUP_ | wc -l)"; echo "key var: ${PRIVATE_KEY:-unset}"', { ...preset, O1_SETUP_CHAINS: '8453,56', O1_SETUP_RPC_URL_8453: 'https://rpc.test' });
     expect(ok.code, ok.out).toBe(0);
     const env = readFileSync(join(app, '.env'), 'utf8');
     expect(env).toContain(`PRIVATE_KEY=${PRIVATE_KEY}`);
     expect(env).toContain('ENABLED_CHAINS=8453,56');
-    expect(env).toContain('RPC_URL_8453=http://rpc.test');
+    expect(env).toContain('RPC_URL_8453=https://rpc.test');
     // secrets are scrubbed from the shell (and so from every child process) once written
     expect(ok.out).toContain('presets left: 0');
     expect(ok.out).toContain('key var: unset');
@@ -197,6 +204,11 @@ describe('setup-vps.sh: functions', () => {
     const missing = sh('configure_env', { ...preset, O1_APP_DIR: tempDir(), O1_SETUP_O1_API_KEY: '' });
     expect(missing.code).not.toBe(0);
     expect(missing.out).toContain('Butuh input interaktif');
+    // plain http to another machine would put the RPC key and every receipt on the wire in the clear
+    const plainHttp = sh('configure_env', { ...preset, O1_APP_DIR: tempDir(), O1_SETUP_CHAINS: '8453', O1_SETUP_RPC_URL_8453: 'http://rpc.example.com' });
+    expect(plainHttp.code).not.toBe(0);
+    expect(plainHttp.out).toContain('O1_SETUP_RPC_URL_8453 tidak valid (harus https://');
+    expect(sh('configure_env', { ...preset, O1_APP_DIR: tempDir(), O1_SETUP_CHAINS: '8453', O1_SETUP_RPC_URL_8453: 'http://127.0.0.1:8545' }).code).toBe(0);
     // Robinhood Chain has no default RPC, so it cannot be enabled without one
     const noRpc = sh('configure_env', { ...preset, O1_APP_DIR: tempDir(), O1_SETUP_CHAINS: '4663' });
     expect(noRpc.code).not.toBe(0);

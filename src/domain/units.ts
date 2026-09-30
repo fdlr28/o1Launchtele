@@ -15,6 +15,22 @@ function cleanNumber(text: string): string {
   return text.trim().replace(/\s+/g, '').replace(',', '.');
 }
 
+/**
+ * "1.000" and "1,500" mean one and a half thousand in Indonesian and English typing conventions alike, or
+ * one and one-point-five, depending on which separator the writer treats as the decimal one. Where a wrong
+ * guess moves money, the bot does not guess. (A leading zero, as in "0.005", can only be a decimal.)
+ */
+function rejectAmbiguousGrouping(text: string): void {
+  const compact = text.trim().replace(/\s+/g, '');
+  if (/^[1-9]\d{0,2}[.,]\d{3}$/.test(compact)) {
+    const whole = compact.replace(/[.,]/, '');
+    throw new InputError(
+      `Angka "${compact}" ambigu: ${whole} (dengan pemisah ribuan) atau ${compact.replace(',', '.')} (desimal)? ` +
+        `Tulis ${whole} untuk ribuan, atau ${compact.replace(',', '.')}0 untuk desimal.`,
+    );
+  }
+}
+
 /** "2.5", "2,5" or "2.5%" -> 2_500_000n. Exact, at most 6 decimals, 0..100. */
 export function parsePercent(text: string): bigint {
   const cleaned = cleanNumber(text).replace(/%$/, '');
@@ -33,6 +49,7 @@ export function formatPercent(units: bigint): string {
 
 /** Positive decimal amount in an asset's base units. Rejects extra precision. */
 export function parseAssetAmount(text: string, decimals: number): bigint {
+  rejectAmbiguousGrouping(text);
   const cleaned = cleanNumber(text);
   if (!/^\d+(\.\d+)?$/.test(cleaned)) {
     throw new InputError('Format angka tidak valid. Gunakan titik atau koma sebagai desimal, tanpa pemisah ribuan.');
@@ -50,6 +67,7 @@ const SUFFIX: Record<string, number> = { k: 3, m: 6, b: 9 };
 
 /** Launch-token amount (18 decimals). Accepts 10000, 10k, 2.5m, 1b. */
 export function parseTokenAmount(text: string): bigint {
+  rejectAmbiguousGrouping(text);
   const cleaned = cleanNumber(text).toLowerCase();
   const match = /^(\d+(?:\.\d+)?)([kmb])?$/.exec(cleaned);
   if (!match) throw new InputError('Format jumlah token tidak valid. Contoh: 10000, 10k, 2.5m.');

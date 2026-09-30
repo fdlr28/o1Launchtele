@@ -60,8 +60,19 @@ valid_bot_token()   { [[ "$1" =~ ^[0-9]{5,}:[A-Za-z0-9_-]{30,}$ ]]; }
 valid_user_ids()    { [[ "$1" =~ ^[0-9]{1,15}([[:space:]]*,[[:space:]]*[0-9]{1,15})*$ ]]; }
 valid_private_key() { [[ "$1" =~ ^(0x)?[0-9a-fA-F]{64}$ ]]; }
 valid_api_key()     { [[ "$1" =~ ^o1_launch_[0-9a-f]{8}_[A-Za-z0-9_-]+$ ]]; }
-# Tanpa spasi, kutip, #, $, backtick atau backslash: aman untuk format .env.
-valid_url()         { [[ "$1" =~ ^https?://[^[:space:]\"\'\`\#\$\\]+$ ]]; }
+# https://..., atau http:// hanya ke mesin ini. Tanpa spasi, kutip, #, $, backtick atau backslash: aman untuk format .env.
+valid_url() {
+  [[ "$1" =~ ^https?://[^[:space:]\"\'\`\#\$\\]+$ ]] || return 1
+  [[ "$1" =~ ^https:// ]] && return 0
+  [[ "$1" =~ ^http://(localhost|127\.0\.0\.1|\[::1\])(:[0-9]{1,5})?(/|$) ]]
+}
+
+# Petunjuk singkat yang ditambahkan ke pesan "tidak valid" untuk validator yang aturannya tidak kasat mata.
+validator_hint() {
+  case "$1" in
+    valid_url) printf '%s' ' (harus https://..., atau http:// hanya ke localhost)' ;;
+  esac
+}
 
 valid_chain_list() {
   local id
@@ -231,7 +242,7 @@ ask() {
   local preset="O1_SETUP_${var}" value=""
   if [[ -n "${!preset:-}" ]]; then
     value="${!preset}"
-    "$validator" "$value" || die "Nilai $preset tidak valid."
+    "$validator" "$value" || die "Nilai $preset tidak valid$(validator_hint "$validator")."
   elif [[ ! -t 0 ]]; then
     if [[ "$required" == "1" && -z "$default" ]]; then
       die "Butuh input interaktif untuk $var. Jalankan langsung di terminal SSH (atau set $preset)."
@@ -248,7 +259,7 @@ ask() {
       if [[ -z "$value" ]]; then value="$default"; fi
       if [[ -z "$value" && "$required" == "0" ]]; then break; fi
       if [[ -n "$value" ]] && "$validator" "$value"; then break; fi
-      warn "Format tidak valid, coba lagi."
+      warn "Format tidak valid$(validator_hint "$validator"), coba lagi."
     done
   fi
   printf -v "$var" '%s' "$value"
@@ -343,7 +354,8 @@ WorkingDirectory=${APP_DIR}
 ExecStart=${node_bin} dist/index.js
 Restart=on-failure
 RestartSec=10
-TimeoutStopSec=30
+# Saat dihentikan, bot menunggu launch yang sedang berjalan sampai selesai (maks 120 detik); jangan dipotong.
+TimeoutStopSec=150
 
 # Pengamanan: bot hanya butuh jaringan keluar dan folder data miliknya sendiri.
 NoNewPrivileges=true

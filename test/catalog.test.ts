@@ -4,8 +4,8 @@ import type { O1Api } from '../src/o1/client.js';
 import type { Configuration } from '../src/o1/types.js';
 import { AAPL, USDC, ZERO, addr, configFor, quote, suite } from './fixtures.js';
 
-function apiWith(cfgFor: (product: string) => Configuration) {
-  const getConfig = vi.fn(async (_chain: number, opts: { product: string; market?: string }) => cfgFor(opts.product));
+function apiWith(cfgFor: (product: string, chainId: number) => Configuration) {
+  const getConfig = vi.fn(async (chain: number, opts: { product: string; market?: string }) => cfgFor(opts.product, chain));
   return { api: { getConfig } as unknown as O1Api, getConfig };
 }
 
@@ -47,11 +47,27 @@ describe('Catalog', () => {
   });
 
   it('asks for stock markets only on chains that have them (Monad and Arc are crypto-only)', async () => {
-    const { api, getConfig } = apiWith((p) => configFor(p as 'tax'));
+    const { api, getConfig } = apiWith((p, chain) => configFor(p as 'tax', chain));
     const catalog = new Catalog(api);
     for (const chain of [8453, 4663, 56, 196, 143, 5042]) await catalog.get(chain, 'tax');
     const markets = Object.fromEntries(getConfig.mock.calls.map(([chain, opts]) => [chain, opts.market]));
     expect(markets).toEqual({ 8453: 'all', 4663: 'all', 56: 'all', 196: 'all', 143: 'standard', 5042: 'standard' });
+  });
+
+  it('never lets a suite of another chain into the catalog (its addresses would be trusted by the guard)', async () => {
+    const mixed: Configuration = {
+      chain: { chain_id: 8453, name: 'Base', native_currency: { symbol: 'ETH', decimals: 18 } },
+      suites: [suite('tax', 8453), { ...suite('tax', 56), id: 'bsc-tax' }],
+      quotes: [quote(suite('tax', 8453).id, ZERO, 'ETH'), quote('bsc-tax', USDC, 'USDC')],
+    };
+    const entry = await new Catalog(apiWith(() => mixed).api).get(8453, 'tax');
+    expect(entry.suites.map((s) => s.chain_id)).toEqual([8453]);
+    expect(entry.quotes.map((q) => q.symbol)).toEqual(['ETH']);
+  });
+
+  it('rejects a configuration that answers for another chain than the one asked', async () => {
+    const { api } = apiWith(() => configFor('tax', 56));
+    await expect(new Catalog(api).get(8453, 'tax')).rejects.toThrow(/konfigurasi chain 56, bukan 8453/);
   });
 
   it('does not cache failures', async () => {

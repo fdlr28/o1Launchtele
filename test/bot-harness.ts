@@ -2,6 +2,7 @@ import type { BotError } from 'grammy';
 import { vi } from 'vitest';
 import { createBot } from '../src/bot/app.js';
 import type { BotContext } from '../src/bot/state.js';
+import { BackgroundTasks } from '../src/bot/tasks.js';
 import type { BotDeps } from '../src/bot/panel.js';
 import type { UserState } from '../src/bot/state.js';
 import type { AppConfig } from '../src/config.js';
@@ -33,8 +34,9 @@ export function createHarness() {
   const dataDir = tempDir();
   const history = new History(dataDir);
   const catalog = new Catalog(api);
-  const launcher = new Launcher({ api, catalog, wallet, history, log: silentLogger, strictTargets: true, sleep: clock.sleep, now: clock.now });
+  const launcher = new Launcher({ api, catalog, wallet, history, log: silentLogger, sleep: clock.sleep, now: clock.now });
   const files = new Map<string, Uint8Array>();
+  const tasks = new BackgroundTasks();
 
   const config: AppConfig = {
     telegramToken: TOKEN,
@@ -42,11 +44,11 @@ export function createHarness() {
     privateKey: `0x${'11'.repeat(32)}`,
     o1ApiKey: 'o1_launch_abcdef12_secret',
     o1ApiBaseUrl: 'https://api.test/v1',
-    rpcUrls: { 8453: 'http://rpc.test' },
+    rpcUrls: { 8453: 'https://rpc.test' },
     explorerUrls: {},
     chainIds: [8453],
     devBuySlippageBps: 500,
-    strictTargets: true,
+    extraAllowedTargets: [],
     dataDir,
     logLevel: 'error',
   };
@@ -58,6 +60,7 @@ export function createHarness() {
     launcher,
     history,
     log: silentLogger,
+    tasks,
     downloadFile: async (_api, fileId) => {
       const bytes = files.get(fileId);
       if (!bytes) throw new Error(`no such fake file ${fileId}`);
@@ -115,7 +118,7 @@ export function createHarness() {
   }
 
   const h = {
-    clock, api, wallet, launcher, history, store, bot, calls, config, files, dataDir, faults, errors,
+    clock, api, wallet, launcher, history, store, bot, calls, config, files, dataDir, faults, errors, tasks,
     /** Set to true in tests that deliberately provoke a handler error. */
     allowErrors: false,
 
@@ -127,9 +130,9 @@ export function createHarness() {
       await send({ text }, userId);
     },
 
-    async command(name: string, userId = OWNER, chatType = 'private') {
-      const text = `/${name}`;
-      await send({ text, entities: [{ type: 'bot_command', offset: 0, length: text.length }] }, userId, chatType);
+    async command(name: string, userId = OWNER, chatType = 'private', args = '') {
+      const head = `/${name}`;
+      await send({ text: args ? `${head} ${args}` : head, entities: [{ type: 'bot_command', offset: 0, length: head.length }] }, userId, chatType);
     },
 
     async photo(fileId: string, size = 1000, userId = OWNER) {

@@ -1,6 +1,7 @@
 import type { Context } from 'grammy';
 import type { Draft } from '../domain/draft.js';
 import type { PairFilter } from '../o1/catalog.js';
+import type { ReviewedFee } from '../services/launcher.js';
 
 export const FIELD_KEYS = [
   'name',
@@ -46,6 +47,12 @@ export interface PairUi {
   page: number;
 }
 
+/** What the owner saw and confirmed on the review screen: the fee, and the exact draft it was computed for. */
+export interface ReviewedSnapshot {
+  fee: ReviewedFee;
+  fingerprint: string;
+}
+
 export interface UserState {
   draft: Draft | null;
   /** The last launched draft; its reusable settings seed the next one. */
@@ -54,8 +61,8 @@ export interface UserState {
   panel: { chatId: number; messageId: number } | null;
   awaiting: Awaiting | null;
   pairUi: PairUi;
-  /** Native creation fee shown on the last review; the launch aborts if it rises. */
-  reviewedFeeRaw: bigint | null;
+  /** Set by a passing review; the launch only starts for the very draft it was made for, and aborts if the fee rises. */
+  reviewed: ReviewedSnapshot | null;
   /** One-shot warning shown on the next dashboard render. */
   notice: string | null;
   launching: boolean;
@@ -70,7 +77,7 @@ export function freshState(): UserState {
     panel: null,
     awaiting: null,
     pairUi: { filter: 'crypto', query: '', page: 0 },
-    reviewedFeeRaw: null,
+    reviewed: null,
     notice: null,
     launching: false,
   };

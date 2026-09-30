@@ -1,7 +1,7 @@
 import { GrammyError, type Api, type InlineKeyboard } from 'grammy';
 import { CHAINS, addressUrl, chainName, txUrl } from '../chains.js';
 import type { AppConfig } from '../config.js';
-import type { Draft, DraftQuote } from '../domain/draft.js';
+import { draftFingerprint, type Draft, type DraftQuote } from '../domain/draft.js';
 import { readTaxPolicy } from '../domain/tax.js';
 import { describeError } from '../errors.js';
 import type { Logger } from '../logger.js';
@@ -23,6 +23,7 @@ import {
   taxKeyboard,
 } from './keyboards.js';
 import type { BotContext, FieldKey, UserState, ViewName } from './state.js';
+import type { BackgroundTasks } from './tasks.js';
 import {
   chainViewText,
   dashboardText,
@@ -42,6 +43,8 @@ export interface BotDeps {
   launcher: Launcher;
   history: History;
   log: Logger;
+  /** Launches run in the background; shutdown waits for them. */
+  tasks: BackgroundTasks;
   /** Downloads a Telegram file (injected so tests need no network). */
   downloadFile: (api: Api, fileId: string) => Promise<Uint8Array>;
 }
@@ -176,8 +179,9 @@ export class Ui {
         };
       }
       case 'review': {
-        const review = await buildReview({ catalog: this.deps.catalog, wallet: this.deps.wallet }, draft);
-        state.reviewedFeeRaw = review.ctx ? (review.ctx.fee?.isNative ? review.ctx.fee.amountRaw : 0n) : null;
+        const review = await buildReview({ catalog: this.deps.catalog, wallet: this.deps.wallet, launcher: this.deps.launcher }, draft);
+        // Only a passing review can be confirmed, and only for exactly this draft.
+        state.reviewed = review.ok && review.reviewedFee ? { fee: review.reviewedFee, fingerprint: draftFingerprint(draft) } : null;
         return {
           text: reviewText(draft, review, name, this.deps.wallet.address),
           keyboard: reviewKeyboard(review.ok),

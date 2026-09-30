@@ -1,8 +1,8 @@
 import { Api } from 'grammy';
 import dotenv from 'dotenv';
-import { ConfigError, loadConfig, type AppConfig } from './config.js';
+import { ConfigError, configSecrets, loadConfig, type AppConfig } from './config.js';
 import { runDoctor } from './doctor.js';
-import { redact, secretVariants } from './logger.js';
+import { redact } from './logger.js';
 import { O1Client } from './o1/client.js';
 import { ViemWallet } from './wallet/wallet.js';
 
@@ -21,7 +21,7 @@ async function main(): Promise<void> {
   }
 
   // Defence in depth: nothing printed may contain a secret, even inside a third-party error message.
-  const secrets = secretVariants(config.privateKey, config.o1ApiKey, config.telegramToken);
+  const secrets = configSecrets(config);
   const print = (line: string) => console.log(redact(line, secrets));
   print('✅ .env terbaca dan formatnya valid');
 

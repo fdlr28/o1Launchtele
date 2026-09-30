@@ -28,8 +28,22 @@ export class TxRevertedError extends TxError {}
 /** Broadcast, but no receipt within the timeout. It may still confirm: never resend blindly. */
 export class TxUnknownError extends TxError {}
 
+let sanitizer: (text: string) => string = (text) => text;
+
+/**
+ * Everything describeError returns ends up in Telegram messages and logs. The app installs a redactor here
+ * so that a secret inside a third-party error message (an RPC URL with a key, say) can never get out.
+ */
+export function setErrorSanitizer(fn: (text: string) => string): void {
+  sanitizer = fn;
+}
+
 /** Plain-text (not HTML-escaped) description of any error, in Indonesian. */
 export function describeError(err: unknown): string {
+  return sanitizer(describeErrorRaw(err));
+}
+
+function describeErrorRaw(err: unknown): string {
   if (err instanceof UserFacingError || err instanceof InputError) return err.message;
   if (err instanceof ApiError) return describeApiError(err);
   if (err instanceof Error) {

@@ -32,7 +32,7 @@ export function pairLabel(quote: { symbol: string; route: string }): string {
 export function devBuyLabel(draft: Draft, quoteSymbol: string | undefined, decimals: number): string {
   const dev = draft.devBuy;
   if (!dev.enabled) return 'OFF';
-  const amount = dev.amountRaw ? `${formatAmount(BigInt(dev.amountRaw), decimals)} ${quoteSymbol ?? ''}`.trim() : '<i>jumlah belum diisi</i>';
+  const amount = dev.amountRaw ? esc(`${formatAmount(BigInt(dev.amountRaw), decimals)} ${quoteSymbol ?? ''}`.trim()) : '<i>jumlah belum diisi</i>';
   const timing = dev.timing === 'auto' ? 'tunggu anti-snipe' : 'segera';
   return `ON · ${amount} · slippage ${formatPercent(BigInt(dev.slippageBps) * 10_000n)}% · ${timing}`;
 }
@@ -218,8 +218,10 @@ export function reviewText(draft: Draft, review: Review, chainName: string, wall
   if (draft.devBuy.enabled) {
     lines.push(`  Dev buy: ${devBuyLabel(draft, draft.quote?.symbol, draft.quote?.decimals ?? 18)}`);
   }
-  if (ctx && review.balanceNative !== null) {
-    lines.push(`  Saldo wallet: ${esc(formatAmount(review.balanceNative, ctx.nativeDecimals))} ${esc(ctx.nativeSymbol)} (+ gas dibutuhkan)`);
+  for (const fund of review.funds) {
+    if (fund.balanceRaw === null) continue;
+    const need = fund.requiredRaw > 0n ? `butuh ${formatAmount(fund.requiredRaw, fund.decimals)}${fund.isNative ? ' + gas' : ''}` : fund.isNative ? 'butuh gas' : 'tidak dipakai';
+    lines.push(`  Saldo ${esc(fund.symbol)}: ${esc(formatAmount(fund.balanceRaw, fund.decimals))} (${esc(need)})`);
   }
   lines.push(`  Wallet: ${code(shortAddress(wallet))}`);
 

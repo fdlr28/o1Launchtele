@@ -7,6 +7,16 @@ import { isNativeQuote, type Catalog } from '../o1/catalog.js';
 import { draftProblems } from '../o1/launchRequest.js';
 import type { Wallet } from '../wallet/wallet.js';
 import { resolveLaunchContext, type LaunchContext } from './context.js';
+import { NO_FEE, PendingLaunchError, type Launcher, type ReviewedFee } from './launcher.js';
+
+/** One line of the funds check: what the wallet holds against what the launch needs. */
+export interface FundsLine {
+  symbol: string;
+  decimals: number;
+  isNative: boolean;
+  balanceRaw: bigint | null;
+  requiredRaw: bigint;
+}
 
 export interface Review {
   ok: boolean;
@@ -14,17 +24,15 @@ export interface Review {
   warnings: string[];
   ctx: LaunchContext | null;
   taxPolicy: TaxPolicy | null;
-  /** Native currency the launcher needs (creation fee + native dev buy), excluding gas. */
-  requiredNative: bigint;
-  /** Quote-token amount needed when the dev buy is paid in an ERC-20 pair. */
-  requiredQuote: bigint;
-  balanceNative: bigint | null;
-  balanceQuote: bigint | null;
+  /** The creation fee the owner is about to accept; the launch aborts if the live fee is higher. */
+  reviewedFee: ReviewedFee | null;
+  funds: FundsLine[];
 }
 
 export interface ReviewDeps {
   catalog: Catalog;
   wallet: Wallet;
+  launcher: Pick<Launcher, 'pendingLaunches'>;
 }
 
 export async function buildReview(deps: ReviewDeps, draft: Draft): Promise<Review> {
@@ -42,28 +50,50 @@ export async function buildReview(deps: ReviewDeps, draft: Draft): Promise<Revie
   }
   problems.push(...draftProblems(draft, ctx?.suite));
 
+  try {
+    const pending = await deps.launcher.pendingLaunches();
+    if (pending.length > 0) problems.push(new PendingLaunchError(pending).message);
+  } catch (err) {
+    warnings.push(`Riwayat launch tidak bisa diperiksa (${describeError(err).split('\n')[0]}).`);
+  }
+
   const taxPolicy = ctx && draft.product === 'tax' ? readTaxPolicy(ctx.suite) : null;
   const devBuyAmount = draft.devBuy.enabled && draft.devBuy.amountRaw ? BigInt(draft.devBuy.amountRaw) : 0n;
   const nativeQuote = draft.quote ? isNativeQuote(draft.quote) : false;
-
-  const requiredNative = (ctx?.fee?.isNative ? ctx.fee.amountRaw : 0n) + (nativeQuote ? devBuyAmount : 0n);
-  const requiredQuote = !nativeQuote ? devBuyAmount : 0n;
-  let balanceNative: bigint | null = null;
-  let balanceQuote: bigint | null = null;
+  const funds: FundsLine[] = [];
 
   if (ctx) {
+    const fee = ctx.fee;
+    const feeToken = fee && !fee.isNative ? fee : null;
+
+    // Native currency: creation fee (when paid natively) + a native dev buy. Gas comes on top.
+    const requiredNative = (fee?.isNative ? fee.amountRaw : 0n) + (nativeQuote ? devBuyAmount : 0n);
+    // ERC-20s: an ERC-20 creation fee and/or an ERC-20 dev buy (possibly the same token).
+    const erc20 = new Map<string, { symbol: string; decimals: number; required: bigint; address: `0x${string}` }>();
+    const need = (address: `0x${string}`, symbol: string, decimals: number, amount: bigint) => {
+      if (amount <= 0n) return;
+      const key = address.toLowerCase();
+      const line = erc20.get(key);
+      if (line) line.required += amount;
+      else erc20.set(key, { symbol, decimals, required: amount, address });
+    };
+    if (feeToken) need(feeToken.currency, feeToken.symbol, feeToken.decimals, feeToken.amountRaw);
+    if (draft.quote && !nativeQuote) need(draft.quote.address, draft.quote.symbol, draft.quote.decimals, devBuyAmount);
+
     try {
-      balanceNative = await deps.wallet.nativeBalance(draft.chainId);
+      const balanceNative = await deps.wallet.nativeBalance(draft.chainId);
+      funds.push({ symbol: ctx.nativeSymbol, decimals: ctx.nativeDecimals, isNative: true, balanceRaw: balanceNative, requiredRaw: requiredNative });
       if (balanceNative < requiredNative) {
         problems.push(
           `Saldo ${ctx.nativeSymbol} kurang: punya ${formatAmount(balanceNative, ctx.nativeDecimals)}, butuh minimal ${formatAmount(requiredNative, ctx.nativeDecimals)} (belum termasuk gas).`,
         );
       }
-      if (!nativeQuote && draft.quote && requiredQuote > 0n) {
-        balanceQuote = await deps.wallet.erc20Balance(draft.chainId, draft.quote.address);
-        if (balanceQuote < requiredQuote) {
+      for (const token of erc20.values()) {
+        const balance = await deps.wallet.erc20Balance(draft.chainId, token.address);
+        funds.push({ symbol: token.symbol, decimals: token.decimals, isNative: false, balanceRaw: balance, requiredRaw: token.required });
+        if (balance < token.required) {
           problems.push(
-            `Saldo ${draft.quote.symbol} kurang: punya ${formatAmount(balanceQuote, draft.quote.decimals)}, butuh ${formatAmount(requiredQuote, draft.quote.decimals)} untuk dev buy.`,
+            `Saldo ${token.symbol} kurang: punya ${formatAmount(balance, token.decimals)}, butuh ${formatAmount(token.required, token.decimals)} (creation fee dan/atau dev buy).`,
           );
         }
       }
@@ -79,5 +109,6 @@ export async function buildReview(deps: ReviewDeps, draft: Draft): Promise<Revie
     }
   }
 
-  return { ok: problems.length === 0, problems, warnings, ctx, taxPolicy, requiredNative, requiredQuote, balanceNative, balanceQuote };
+  const reviewedFee: ReviewedFee | null = ctx ? (ctx.fee ? { currency: ctx.fee.currency, amountRaw: ctx.fee.amountRaw } : NO_FEE) : null;
+  return { ok: problems.length === 0, problems, warnings, ctx, taxPolicy, reviewedFee, funds };
 }

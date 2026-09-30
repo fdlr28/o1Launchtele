@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { FEE_RAW, tempDir } from './fakes.js';
 import { FACTORY, TOKEN } from './fixtures.js';
 import { API_KEY, BOT_TOKEN, MockO1, MockTelegram, OWNER, PRIVATE_KEY, WALLET } from './mock-servers.js';
@@ -202,3 +202,191 @@ describe('end to end (real process, local mock Telegram / o1 API / EVM node)', (
   });
 });
 
+
+// ---------------------------------------------------------------------------------------------
+/** A complete stack of mocks plus the real bot process, for tests that need their own lifecycle. */
+interface Stack {
+  tg: MockTelegram;
+  o1: MockO1;
+  rpc: MockRpc;
+  dataDir: string;
+  child: ChildProcess;
+  output: () => string;
+  exited: Promise<number | null>;
+  until: (predicate: () => boolean, what: string, timeout?: number) => Promise<void>;
+  fillAndReview: () => Promise<void>;
+  stop: () => Promise<void>;
+}
+
+async function boot(opts: { seedHistory?: string; prepareDelayMs?: number } = {}): Promise<Stack> {
+  const tg = new MockTelegram();
+  const o1 = new MockO1();
+  const rpc = new MockRpc(8453);
+  await Promise.all([tg.start(), o1.start(), rpc.start()]);
+  rpc.codeAddresses.add(TOKEN.toLowerCase());
+  o1.prepareDelayMs = opts.prepareDelayMs ?? 0;
+  const dataDir = tempDir();
+  if (opts.seedHistory) writeFileSync(join(dataDir, 'launches.jsonl'), opts.seedHistory);
+
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']) delete env[key];
+  Object.assign(env, {
+    NO_PROXY: '127.0.0.1,localhost',
+    TELEGRAM_BOT_TOKEN: BOT_TOKEN,
+    TELEGRAM_API_ROOT: tg.url,
+    ALLOWED_USER_IDS: String(OWNER),
+    PRIVATE_KEY,
+    O1_API_KEY: API_KEY,
+    O1_API_BASE_URL: `${o1.url}/v1`,
+    ENABLED_CHAINS: '8453',
+    RPC_URL_8453: rpc.url,
+    DATA_DIR: dataDir,
+    LOG_LEVEL: 'debug',
+    NODE_ENV: 'test',
+  });
+  const child = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts'], { cwd: join(import.meta.dirname, '..'), env });
+  let out = '';
+  child.stdout?.on('data', (d) => (out += d));
+  child.stderr?.on('data', (d) => (out += d));
+  const exited = new Promise<number | null>((resolve) => child.on('close', (code) => resolve(code)));
+
+  const until = (predicate: () => boolean, what: string, timeout = 20_000) =>
+    vi.waitFor(() => {
+      if (!predicate()) throw new Error(`waiting for: ${what}\n--- panel ---\n${tg.panelText()}\n--- bot output ---\n${out.slice(-1500)}`);
+    }, { timeout, interval: 50 });
+
+  await vi.waitFor(() => {
+    if (tg.polls === 0) throw new Error(`bot not polling yet\n${out}`);
+  }, { timeout: 30_000, interval: 100 });
+
+  const fillAndReview = async () => {
+    tg.command('launch');
+    await until(() => tg.panelText().includes('Draft Launch o1'), 'dashboard');
+    tg.press('in:name:dash');
+    await until(() => tg.panelText().includes('nama token'), 'name prompt');
+    tg.text('Pepe Coin');
+    await until(() => tg.panelText().includes('Pepe Coin'), 'name set');
+    tg.press('in:symbol:dash');
+    await until(() => tg.panelText().includes('simbol'), 'symbol prompt');
+    tg.text('$PEPE');
+    await until(() => tg.panelText().includes('PEPE'), 'symbol set');
+    tg.press('in:image:dash');
+    await until(() => tg.panelText().includes('gambar token'), 'image prompt');
+    tg.photo('file-1');
+    await until(() => tg.panelText().includes('Gambar: PNG'), 'image accepted');
+    tg.press('nav:review');
+    await until(() => tg.panelText().includes('Review Launch'), 'review shown');
+  };
+
+  return {
+    tg, o1, rpc, dataDir, child, exited, until, fillAndReview,
+    output: () => out,
+    stop: async () => {
+      if (child.exitCode === null) child.kill('SIGKILL');
+      await exited;
+      await Promise.all([tg.stop(), o1.stop(), rpc.stop()]);
+    },
+  };
+}
+
+describe('end to end: shutdown and crash recovery (real process)', () => {
+  let stack: Stack | undefined;
+  afterEach(async () => {
+    await stack?.stop();
+    stack = undefined;
+  });
+
+  it('exits promptly and cleanly on SIGTERM when nothing is running', async () => {
+    stack = await boot();
+    stack.child.kill('SIGTERM');
+    const code = await Promise.race([stack.exited, new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 15_000))]);
+    expect(code).toBe(0);
+    expect(stack.output()).toContain('SIGTERM: berhenti menerima perintah baru');
+  }, 60_000);
+
+  it('lets a running launch finish, delivers its result, and only then exits', async () => {
+    stack = await boot({ prepareDelayMs: 3_000 });
+    const { tg, o1, rpc, until, child, exited } = stack;
+    await stack.fillAndReview();
+    tg.press('go:launch');
+    await until(() => o1.bodies.length === 1, 'prepare request in flight');
+
+    child.kill('SIGTERM');
+    const early = await Promise.race([exited, new Promise<'alive'>((resolve) => setTimeout(() => resolve('alive'), 1_000))]);
+    expect(early, 'the bot must not exit while a launch is running').toBe('alive');
+
+    const code = await Promise.race([exited, new Promise<'hung'>((resolve) => setTimeout(() => resolve('hung'), 40_000))]);
+    expect(code).toBe(0);
+    expect(stack.output()).toContain('menunggu sampai selesai');
+
+    // the launch was completed on chain ...
+    expect(rpc.received).toHaveLength(1);
+    const lines = readFileSync(join(stack.dataDir, 'launches.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    expect(lines.map((l) => l.status)).toEqual(['sent', 'confirmed']);
+    // ... and the user was told, even though the process was already shutting down
+    expect(tg.panelText()).toContain('Launch berhasil');
+  }, 90_000);
+
+  it('a launch left unresolved by a crash blocks new launches and warns the owner at startup', async () => {
+    const hash = `0x${'a1'.repeat(32)}`;
+    stack = await boot({
+      seedHistory: JSON.stringify({ ts: new Date().toISOString(), kind: 'launch', status: 'unknown', chainId: 8453, name: 'Old Coin', symbol: 'OLD', txHash: hash }) + '\n',
+    });
+    const { tg, rpc, until } = stack;
+
+    await until(() => tg.calls.some((c) => c.method === 'sendMessage' && String(c.payload.text).includes('Bot baru saja menyala')), 'startup warning');
+    const warning = String(tg.calls.find((c) => String(c.payload.text ?? '').includes('Bot baru saja menyala'))?.payload.text);
+    expect(warning).toContain('Old Coin');
+    expect(warning).toContain(`https://basescan.org/tx/${hash}`);
+    expect(warning).toContain('/dismiss ya');
+    expect(stack.output()).toContain(`launch tertunda: ${hash}`);
+
+    await stack.fillAndReview();
+    expect(tg.panelText()).toContain('Ada launch sebelumnya yang hasilnya belum jelas');
+    expect(tg.calls.some((c) => c.payload.reply_markup && JSON.stringify(c.payload.reply_markup).includes('go:launch'))).toBe(false);
+    tg.press('go:launch'); // even a forged button press cannot get around it
+    await until(() => tg.calls.some((c) => c.method === 'answerCallbackQuery' && String(c.payload.text).includes('Review')), 'launch refused');
+    expect(rpc.received).toHaveLength(0);
+
+    tg.command('dismiss');
+    await until(() => tg.calls.some((c) => c.method === 'sendMessage' && String(c.payload.text).includes('Launch tertunda')), '/dismiss lists it');
+    tg.text('/dismiss ya', [{ type: 'bot_command', offset: 0, length: 8 }]);
+    await until(() => tg.calls.some((c) => c.method === 'sendMessage' && String(c.payload.text).includes('Diabaikan: 1')), 'dismissed');
+
+    tg.press('nav:review');
+    await until(() => tg.panelText().includes('Semua cek lolos'), 'review passes again');
+  }, 90_000);
+
+  it('refuses to start with a plain-http o1 API URL, naming the problem and leaking nothing', async () => {
+    const tg = new MockTelegram();
+    await tg.start();
+    try {
+      const env: NodeJS.ProcessEnv = { ...process.env };
+      for (const key of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']) delete env[key];
+      Object.assign(env, {
+        TELEGRAM_BOT_TOKEN: BOT_TOKEN,
+        TELEGRAM_API_ROOT: tg.url,
+        ALLOWED_USER_IDS: String(OWNER),
+        PRIVATE_KEY,
+        O1_API_KEY: API_KEY,
+        O1_API_BASE_URL: 'http://api.example.com/v1',
+        ENABLED_CHAINS: '8453',
+        RPC_URL_8453: 'https://rpc.example.com',
+        DATA_DIR: tempDir(),
+      });
+      const result = await new Promise<{ code: number | null; out: string }>((resolve) => {
+        const proc = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts'], { cwd: join(import.meta.dirname, '..'), env });
+        let out = '';
+        proc.stdout?.on('data', (d) => (out += d));
+        proc.stderr?.on('data', (d) => (out += d));
+        proc.on('close', (code) => resolve({ code, out }));
+      });
+      expect(result.code).toBe(1);
+      expect(result.out).toContain('O1_API_BASE_URL harus URL https://');
+      expect(result.out).not.toContain(API_KEY);
+      expect(tg.polls).toBe(0);
+    } finally {
+      await tg.stop();
+    }
+  }, 60_000);
+});

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { ConfigError, loadConfig } from '../src/config.js';
-import { createLogger, redact, secretVariants } from '../src/logger.js';
+import { ConfigError, configSecrets, loadConfig } from '../src/config.js';
+import { describeError, setErrorSanitizer } from '../src/errors.js';
+import { createLogger, redact, secretVariants, urlSecrets } from '../src/logger.js';
 
 const KEY = `0x${'ab'.repeat(32)}`;
 const BOT = '123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw0';
@@ -30,7 +31,7 @@ describe('loadConfig', () => {
     expect(cfg.privateKey).toBe(KEY);
     expect(cfg.o1ApiBaseUrl).toBe('https://api.launch.o1.exchange/v1');
     expect(cfg.devBuySlippageBps).toBe(500);
-    expect(cfg.strictTargets).toBe(true);
+    expect(cfg.extraAllowedTargets).toEqual([]);
     expect(cfg.dataDir).toBe('./data');
     // chains with a well-known public RPC are enabled by default; Robinhood and Arc need an explicit RPC
     expect(cfg.chainIds.sort((a, b) => a - b)).toEqual([56, 143, 196, 8453]);
@@ -70,7 +71,6 @@ describe('loadConfig', () => {
     expect(errorOf({ ...valid, RPC_URL_8453: 'not a url' })).toContain('RPC_URL_8453');
     expect(errorOf({ ...valid, DEV_BUY_SLIPPAGE_BPS: '5000' })).toContain('DEV_BUY_SLIPPAGE_BPS');
     expect(errorOf({ ...valid, DEV_BUY_SLIPPAGE_BPS: '0' })).toContain('DEV_BUY_SLIPPAGE_BPS');
-    expect(errorOf({ ...valid, STRICT_TARGETS: 'maybe' })).toContain('STRICT_TARGETS');
     expect(errorOf({ ...valid, LOG_LEVEL: 'loud' })).toContain('LOG_LEVEL');
   });
 
@@ -80,11 +80,89 @@ describe('loadConfig', () => {
     expect(message).not.toContain('sk-secret-value');
   });
 
-  it('parses slippage and strict flag', () => {
-    const cfg = loadConfig({ ...valid, DEV_BUY_SLIPPAGE_BPS: '750', STRICT_TARGETS: 'false', LOG_LEVEL: 'debug' });
+  it('parses slippage and log level', () => {
+    const cfg = loadConfig({ ...valid, DEV_BUY_SLIPPAGE_BPS: '750', LOG_LEVEL: 'debug' });
     expect(cfg.devBuySlippageBps).toBe(750);
-    expect(cfg.strictTargets).toBe(false);
     expect(cfg.logLevel).toBe('debug');
+  });
+
+  it('the target check cannot be switched off any more', () => {
+    for (const value of ['false', 'no', '0', 'maybe']) {
+      const message = errorOf({ ...valid, STRICT_TARGETS: value });
+      expect(message, value).toContain('STRICT_TARGETS sudah dihapus');
+      expect(message).toContain('EXTRA_ALLOWED_TARGETS');
+    }
+    // a leftover STRICT_TARGETS=true only states what the bot does anyway
+    expect(() => loadConfig({ ...valid, STRICT_TARGETS: 'true' })).not.toThrow();
+    expect(() => loadConfig({ ...valid, STRICT_TARGETS: 'TRUE' })).not.toThrow();
+  });
+
+  it('reads EXTRA_ALLOWED_TARGETS as a list of addresses and rejects anything else', () => {
+    const a = '0x1111111111111111111111111111111111111111';
+    const b = '0xAbCdEf0123456789aBcDeF0123456789aBcDeF01';
+    expect(loadConfig({ ...valid, EXTRA_ALLOWED_TARGETS: ` ${a}, ${b}` }).extraAllowedTargets).toEqual([a, b.toLowerCase()]);
+    expect(errorOf({ ...valid, EXTRA_ALLOWED_TARGETS: `${a},0x12` })).toContain('EXTRA_ALLOWED_TARGETS berisi alamat yang tidak valid: "0x12"');
+  });
+});
+
+describe('secure URLs', () => {
+  it('requires https for everything that carries a key or a token, except on this machine', () => {
+    expect(errorOf({ ...valid, O1_API_BASE_URL: 'http://api.example.com/v1' })).toContain('O1_API_BASE_URL harus URL https://');
+    expect(errorOf({ ...valid, TELEGRAM_API_ROOT: 'http://bot-api.example.com' })).toContain('TELEGRAM_API_ROOT harus URL https://');
+    expect(errorOf({ ...valid, RPC_URL_8453: 'http://rpc.example.com' })).toContain('RPC_URL_8453 harus URL https://');
+    expect(errorOf({ ...valid, EXPLORER_URL_8453: 'http://scan.example.com' })).toContain('EXPLORER_URL_8453 harus URL https://');
+    // ... a userinfo trick must not pass for localhost
+    expect(errorOf({ ...valid, O1_API_BASE_URL: 'http://localhost:80@evil.example.com/v1' })).toContain('O1_API_BASE_URL');
+    expect(errorOf({ ...valid, RPC_URL_8453: 'http://127.0.0.1.evil.example.com' })).toContain('RPC_URL_8453');
+
+    const local = loadConfig({
+      ...valid,
+      O1_API_BASE_URL: 'http://127.0.0.1:9000/v1',
+      TELEGRAM_API_ROOT: 'http://localhost:8081',
+      RPC_URL_8453: 'http://[::1]:8545',
+    });
+    expect(local.o1ApiBaseUrl).toBe('http://127.0.0.1:9000/v1');
+    expect(local.rpcUrls[8453]).toBe('http://[::1]:8545');
+    expect(loadConfig({ ...valid, O1_API_BASE_URL: 'https://api.example.com/v1' }).o1ApiBaseUrl).toBe('https://api.example.com/v1');
+  });
+});
+
+describe('credential-bearing URLs', () => {
+  const RPC = 'https://base-mainnet.g.alchemy.com/v2/AbCdEf0123456789KeyKeyKey';
+
+  it('extracts the key of an RPC URL, but leaves public endpoints readable', () => {
+    const parts = urlSecrets(RPC);
+    expect(parts).toContain(RPC);
+    expect(parts).toContain('AbCdEf0123456789KeyKeyKey');
+    expect(urlSecrets('https://mainnet.base.org')).toEqual([]);
+    expect(urlSecrets('https://rpc.example/v1?apikey=abcdefgh1234&x=1')).toContain('abcdefgh1234');
+    expect(urlSecrets('https://user:hunter2hunter2@rpc.example')).toEqual(expect.arrayContaining(['hunter2hunter2']));
+    expect(urlSecrets('not a url')).toEqual([]);
+  });
+
+  it('keeps the RPC key out of logs and error descriptions, whichever way it shows up', () => {
+    const config = loadConfig({ ...valid, RPC_URL_8453: RPC });
+    const secrets = configSecrets(config);
+    const lines: string[] = [];
+    const log = createLogger('debug', (line) => lines.push(line), secrets);
+    log.error('rpc failed', new Error(`HTTP request failed. URL: ${RPC} Details: boom`));
+    log.warn(`falling back from .../v2/AbCdEf0123456789KeyKeyKey`);
+    for (const line of lines) expect(line).not.toContain('AbCdEf0123456789KeyKeyKey');
+    expect(lines[0]).toContain('HTTP request failed');
+
+    setErrorSanitizer((text) => redact(text, secrets));
+    try {
+      const shown = describeError(new Error(`connect to ${RPC} failed`));
+      expect(shown).not.toContain('AbCdEf0123456789KeyKeyKey');
+      expect(shown).toContain('connect to');
+    } finally {
+      setErrorSanitizer((text) => text);
+    }
+  });
+
+  it('collects every secret of a config: key with and without 0x, o1 key, bot token and RPC keys', () => {
+    const secrets = configSecrets(loadConfig({ ...valid, RPC_URL_8453: RPC }));
+    for (const expected of [KEY, KEY.slice(2), API, BOT, 'AbCdEf0123456789KeyKeyKey']) expect(secrets).toContain(expected);
   });
 });
 

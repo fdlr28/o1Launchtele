@@ -1,6 +1,6 @@
-import type { Hex } from 'viem';
+import { isAddress, type Hex } from 'viem';
 import { CHAINS, SUPPORTED_CHAIN_IDS } from './chains.js';
-import type { LogLevel } from './logger.js';
+import { secretVariants, urlSecrets, type LogLevel } from './logger.js';
 
 export interface AppConfig {
   telegramToken: string;
@@ -16,7 +16,8 @@ export interface AppConfig {
   /** Chains the bot will try to enable (they still have to pass the RPC chain-id check). */
   chainIds: number[];
   devBuySlippageBps: number;
-  strictTargets: boolean;
+  /** Contracts the owner explicitly trusts on top of those o1 publishes in /config (normally empty). */
+  extraAllowedTargets: string[];
   dataDir: string;
   logLevel: LogLevel;
 }
@@ -26,14 +27,23 @@ export class ConfigError extends Error {}
 const DEFAULT_API_URL = 'https://api.launch.o1.exchange/v1';
 const LOG_LEVELS: LogLevel[] = ['debug', 'info', 'warn', 'error'];
 
-function isHttpUrl(value: string): boolean {
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+/**
+ * https, or plain http to the same machine. Everything the bot talks to carries either a secret (API key,
+ * bot token, an RPC key in the URL) or data that decides money movements (receipts, balances).
+ */
+function isSecureUrl(value: string): boolean {
   try {
     const url = new URL(value);
-    return url.protocol === 'http:' || url.protocol === 'https:';
+    if (url.protocol === 'https:') return true;
+    return url.protocol === 'http:' && LOOPBACK_HOSTS.has(url.hostname);
   } catch {
     return false;
   }
 }
+
+const SECURE_URL_HINT = 'harus URL https:// yang valid (http:// hanya boleh ke localhost)';
 
 /** Reads and validates the environment. Every problem is reported at once. */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -51,7 +61,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
 
   const telegramApiRoot = get('TELEGRAM_API_ROOT');
-  if (telegramApiRoot && !isHttpUrl(telegramApiRoot)) errors.push('TELEGRAM_API_ROOT bukan URL http(s) yang valid.');
+  if (telegramApiRoot && !isSecureUrl(telegramApiRoot)) errors.push(`TELEGRAM_API_ROOT ${SECURE_URL_HINT}.`);
 
   const allowedUserIds = new Set<number>();
   const allowedRaw = required('ALLOWED_USER_IDS', 'ID Telegram numerik yang boleh memakai bot, pisahkan dengan koma');
@@ -72,18 +82,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   }
 
   const o1ApiBaseUrl = get('O1_API_BASE_URL') ?? DEFAULT_API_URL;
-  if (!isHttpUrl(o1ApiBaseUrl)) errors.push('O1_API_BASE_URL bukan URL http(s) yang valid.');
+  if (!isSecureUrl(o1ApiBaseUrl)) errors.push(`O1_API_BASE_URL ${SECURE_URL_HINT}.`);
 
   const rpcUrls: Record<number, string> = {};
   const explorerUrls: Record<number, string> = {};
   for (const id of SUPPORTED_CHAIN_IDS) {
     const rpc = get(`RPC_URL_${id}`) ?? CHAINS[id]?.defaultRpc;
-    if (get(`RPC_URL_${id}`) && !isHttpUrl(get(`RPC_URL_${id}`)!)) errors.push(`RPC_URL_${id} bukan URL http(s) yang valid.`);
+    if (get(`RPC_URL_${id}`) && !isSecureUrl(get(`RPC_URL_${id}`)!)) errors.push(`RPC_URL_${id} ${SECURE_URL_HINT}.`);
     else if (rpc) rpcUrls[id] = rpc;
     const explorer = get(`EXPLORER_URL_${id}`);
     if (explorer) {
-      if (isHttpUrl(explorer)) explorerUrls[id] = explorer;
-      else errors.push(`EXPLORER_URL_${id} bukan URL http(s) yang valid.`);
+      if (isSecureUrl(explorer)) explorerUrls[id] = explorer;
+      else errors.push(`EXPLORER_URL_${id} ${SECURE_URL_HINT}.`);
     }
   }
 
@@ -110,8 +120,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     else devBuySlippageBps = n;
   }
 
-  const strictRaw = get('STRICT_TARGETS')?.toLowerCase();
-  if (strictRaw !== undefined && !['true', 'false'].includes(strictRaw)) errors.push('STRICT_TARGETS harus true atau false.');
+  const extraAllowedTargets: string[] = [];
+  for (const part of (get('EXTRA_ALLOWED_TARGETS') ?? '').split(/[\s,]+/).filter(Boolean)) {
+    if (isAddress(part, { strict: false })) extraAllowedTargets.push(part.toLowerCase());
+    else errors.push(`EXTRA_ALLOWED_TARGETS berisi alamat yang tidak valid: "${part}".`);
+  }
+  // The old opt-out is gone. "true" is what the bot does anyway, so a leftover line is harmless; anything else
+  // would be an owner expecting a check to be off that no longer can be, and must not pass silently.
+  const legacyStrict = get('STRICT_TARGETS');
+  if (legacyStrict !== undefined && legacyStrict.toLowerCase() !== 'true') {
+    errors.push('STRICT_TARGETS sudah dihapus: pemeriksaan target transaksi selalu aktif. Untuk mempercayai kontrak tambahan, isi EXTRA_ALLOWED_TARGETS.');
+  }
 
   const logLevelRaw = (get('LOG_LEVEL') ?? 'info').toLowerCase();
   if (!LOG_LEVELS.includes(logLevelRaw as LogLevel)) errors.push(`LOG_LEVEL harus salah satu dari: ${LOG_LEVELS.join(', ')}.`);
@@ -131,8 +150,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     explorerUrls,
     chainIds,
     devBuySlippageBps,
-    strictTargets: strictRaw !== 'false',
+    extraAllowedTargets,
     dataDir: get('DATA_DIR') ?? './data',
     logLevel: logLevelRaw as LogLevel,
   };
+}
+
+/** Every value that must never appear in a log line or a message: keys, tokens and credential-bearing URLs. */
+export function configSecrets(config: Pick<AppConfig, 'privateKey' | 'o1ApiKey' | 'telegramToken' | 'rpcUrls' | 'telegramApiRoot' | 'o1ApiBaseUrl'>): string[] {
+  return [
+    ...secretVariants(config.privateKey, config.o1ApiKey, config.telegramToken),
+    ...Object.values(config.rpcUrls).flatMap(urlSecrets),
+    ...urlSecrets(config.o1ApiBaseUrl),
+    ...(config.telegramApiRoot ? urlSecrets(config.telegramApiRoot) : []),
+  ];
 }

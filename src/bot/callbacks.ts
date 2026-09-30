@@ -1,6 +1,6 @@
 import type { Bot } from 'grammy';
 import type { Address } from 'viem';
-import { carryOverDraft, newDraft } from '../domain/draft.js';
+import { carryOverDraft, draftFingerprint, newDraft } from '../domain/draft.js';
 import { InputError, ONE_PERCENT } from '../domain/units.js';
 import { findQuote } from '../o1/catalog.js';
 import { draftProblems } from '../o1/launchRequest.js';
@@ -194,7 +194,11 @@ async function handleLaunch(
 ): Promise<void> {
   const draft = st.draft;
   if (!draft) return void (await answer('Sesi kedaluwarsa.', true));
-  if (st.reviewedFeeRaw === null) return void (await answer('Buka Review dulu sebelum launch.', true));
+  if (!st.reviewed) return void (await answer('Buka Review dulu sebelum launch.', true));
+  if (st.reviewed.fingerprint !== draftFingerprint(draft)) {
+    st.reviewed = null;
+    return void (await answer('Draft berubah sejak Review. Buka Review lagi lalu konfirmasi.', true));
+  }
   if (deps.launcher.isBusy()) return void (await answer('Launcher sedang dipakai. Coba lagi sebentar.', true));
 
   // Cheap local re-check; the launcher re-validates everything against fresh /config anyway.

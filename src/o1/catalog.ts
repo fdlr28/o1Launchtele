@@ -1,5 +1,6 @@
 import { zeroAddress, type Address } from 'viem';
 import { STOCK_CHAIN_IDS } from '../chains.js';
+import { UserFacingError } from '../errors.js';
 import type { O1Api } from './client.js';
 import type { ChainConfiguration, ContractSuite, Product, QuoteConfiguration, Route } from './types.js';
 
@@ -53,8 +54,14 @@ export class Catalog {
 
   private async load(chainId: number, product: Product): Promise<CatalogEntry> {
     const cfg = await this.api.getConfig(chainId, { product, market: STOCK_CHAIN_IDS.has(chainId) ? 'all' : 'standard', activeOnly: true });
+    if (cfg.chain && cfg.chain.chain_id !== chainId) {
+      throw new UserFacingError(`API o1 mengembalikan konfigurasi chain ${cfg.chain.chain_id}, bukan ${chainId}.`);
+    }
     const wantsTax = product === 'tax';
-    const suites = (cfg.suites ?? []).filter((s) => (wantsTax ? s.launch_product === 'tax' : s.launch_product !== 'tax'));
+    // The contract addresses of a suite become the guard's allow-list, so a suite of another chain must never get in.
+    const suites = (cfg.suites ?? []).filter(
+      (s) => s.chain_id === chainId && (wantsTax ? s.launch_product === 'tax' : s.launch_product !== 'tax'),
+    );
     const suiteIds = new Set(suites.map((s) => s.id));
     const quotes = (cfg.quotes ?? []).filter((q) => suiteIds.has(q.suite_id));
     return { chainId, product, chain: cfg.chain, suites, quotes, fetchedAt: this.now() };

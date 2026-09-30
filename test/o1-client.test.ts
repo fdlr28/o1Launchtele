@@ -170,6 +170,59 @@ describe('O1Client', () => {
     await expect(client.tokenIndexed(8453, TOKEN)).rejects.toMatchObject({ code: 'invalid_api_key' });
   });
 
+  describe('hostile or broken responses', () => {
+    it('never follows a redirect (the API key must not travel to another host) and does not retry it', async () => {
+      const { client, calls } = setup([
+        new Response(null, { status: 302, headers: { location: 'https://evil.example/steal' } }),
+        jsonResponse(200, envelope({})),
+      ]);
+      const err = (await client.getConfig(8453, { product: 'tax' }).catch((e) => e)) as ApiError;
+      expect(err).toBeInstanceOf(ApiError);
+      expect(err.code).toBe('unexpected_redirect');
+      expect(err.message).toContain('O1_API_BASE_URL');
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.init.redirect).toBe('manual');
+    });
+
+    it('retries when the body is lost mid-transfer, then succeeds', async () => {
+      const broken = new Response('x', { status: 200 });
+      vi.spyOn(broken, 'text').mockRejectedValueOnce(new TypeError('terminated'));
+      const { client, calls, sleeps } = setup([broken, jsonResponse(200, envelope({ suites: [] }))]);
+      await expect(client.getConfig(8453, { product: 'tax' })).resolves.toEqual({ suites: [] });
+      expect(calls).toHaveLength(2);
+      expect(sleeps).toHaveLength(1);
+    });
+
+    it('retries a lost preparation body with the very same idempotency key', async () => {
+      const broken = new Response('x', { status: 200 });
+      vi.spyOn(broken, 'text').mockRejectedValueOnce(new TypeError('terminated'));
+      const { client, calls } = setup([broken, jsonResponse(200, envelope({ predicted_token_address: TOKEN }))]);
+      await client.prepareLaunch({ a: 1 } as never, 'stable-key');
+      expect(calls.map((c) => (c.init.headers as Record<string, string>)['idempotency-key'])).toEqual(['stable-key', 'stable-key']);
+    });
+
+    it('gives up with a network error when the body keeps getting lost', async () => {
+      const bodies = Array.from({ length: 8 }, () => {
+        const res = new Response('x', { status: 200 });
+        vi.spyOn(res, 'text').mockRejectedValue(new TypeError('terminated'));
+        return res;
+      });
+      const { client, calls } = setup(bodies);
+      const err = (await client.getConfig(8453, { product: 'tax' }).catch((e) => e)) as ApiError;
+      expect(err.code).toBe('network_error');
+      expect(err.message).toContain('terputus');
+      expect(calls.length).toBeLessThan(8);
+    });
+
+    it('refuses an absurdly large response before reading it', async () => {
+      const huge = new Response('{}', { status: 200, headers: { 'content-length': String(64 * 1024 * 1024) } });
+      const textSpy = vi.spyOn(huge, 'text');
+      const { client } = setup([huge]);
+      await expect(client.getConfig(8453, { product: 'tax' })).rejects.toMatchObject({ code: 'response_too_large' });
+      expect(textSpy).not.toHaveBeenCalled();
+    });
+  });
+
   it('reports a malformed success body', async () => {
     const { client } = setup([new Response('<html>oops</html>', { status: 200 })]);
     await expect(client.getConfig(8453, { product: 'tax' })).rejects.toMatchObject({ code: 'invalid_response' });

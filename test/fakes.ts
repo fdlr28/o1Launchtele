@@ -14,7 +14,15 @@ import type {
   SwapQuoteResult,
 } from '../src/o1/types.js';
 import type { SafeTx } from '../src/services/guard.js';
-import type { Receipt, TypedDataPayload, Wallet } from '../src/wallet/wallet.js';
+import {
+  BroadcastRejectedError,
+  BroadcastUncertainError,
+  type Receipt,
+  type SignedTx,
+  type TxStatus,
+  type TypedDataPayload,
+  type Wallet,
+} from '../src/wallet/wallet.js';
 import { FACTORY, TOKEN, WALLET, configFor } from './fixtures.js';
 
 export const FEE_RAW = '1000000000000000';
@@ -37,22 +45,54 @@ export function tempDir(): string {
 
 export type ReceiptBehavior = 'success' | 'reverted' | 'timeout';
 
+/**
+ * How the fake network treats one broadcast:
+ *  ok               the node accepts the transaction
+ *  rejected         the node answers with an error and does not have it
+ *  uncertain-landed the reply is lost, but the node did accept the transaction
+ *  uncertain-lost   the reply is lost and the node never saw the transaction
+ */
+export type BroadcastBehavior = 'ok' | 'rejected' | 'uncertain-landed' | 'uncertain-lost';
+
+export interface SentTx {
+  chainId: number;
+  tx: SafeTx;
+  hash: Hash;
+}
+
 export class FakeWallet implements Wallet {
   readonly address: Address = WALLET;
-  sent: Array<{ chainId: number; tx: SafeTx; hash: Hash }> = [];
+  /** Every transaction that was signed, in order. */
+  signedTxs: SentTx[] = [];
+  /** Every broadcast attempt, whatever its outcome. */
+  broadcasts: SentTx[] = [];
+  /** Transactions the network actually has (accepted, whether or not the caller heard back). */
+  sent: SentTx[] = [];
   signed: TypedDataPayload[] = [];
   /** Consumed per waitForReceipt call; defaults to success. */
   receipts: ReceiptBehavior[] = [];
+  /** Consumed per broadcast call; defaults to ok. */
+  broadcastBehaviors: BroadcastBehavior[] = [];
+  /** Per-hash answers of transactionStatus; accepted transactions default to success, others to unknown. */
+  statuses = new Map<Hash, TxStatus>();
+  /** Make transactionStatus throw (RPC down). */
+  statusError = false;
+  statusCalls = 0;
+  /** Called inside broadcast() before the network is involved; lets tests inspect what was durable by then. */
+  onBroadcast?: (signed: SentTx) => void | Promise<void>;
+  /** Thrown by the next sign() call (e.g. a gas estimate that reverts). */
+  signError: Error | null = null;
   codeAfterCalls = 0;
   private codeCalls = 0;
   launchTimestamp = 1_000;
   latestTimestamp = 1_004;
   balance = 10n ** 18n;
   quoteBalance = 10n ** 12n;
+  chains = [8453];
   private counter = 0;
 
   enabledChains() {
-    return [8453];
+    return this.chains;
   }
   async nativeBalance() {
     return this.balance;
@@ -60,11 +100,34 @@ export class FakeWallet implements Wallet {
   async erc20Balance() {
     return this.quoteBalance;
   }
-  async send(chainId: number, tx: SafeTx): Promise<Hash> {
+  async sign(chainId: number, tx: SafeTx): Promise<SignedTx> {
+    if (this.signError) {
+      const err = this.signError;
+      this.signError = null;
+      throw err;
+    }
     this.counter++;
     const hash = `0x${this.counter.toString(16).padStart(64, '0')}` as Hash;
-    this.sent.push({ chainId, tx, hash });
-    return hash;
+    this.signedTxs.push({ chainId, tx, hash });
+    return { hash, raw: `0x02${this.counter.toString(16).padStart(4, '0')}` as Hex };
+  }
+  async broadcast(chainId: number, signed: SignedTx): Promise<void> {
+    const entry = this.signedTxs.find((s) => s.hash === signed.hash);
+    if (!entry) throw new Error('FakeWallet: broadcast of a transaction that was never signed here');
+    this.broadcasts.push(entry);
+    await this.onBroadcast?.(entry);
+    const behavior = this.broadcastBehaviors.shift() ?? 'ok';
+    if (behavior === 'rejected') throw new BroadcastRejectedError('Node menolak transaksi: nonce too low');
+    if (behavior === 'uncertain-lost') throw new BroadcastUncertainError('Hasil pengiriman tidak pasti: timeout');
+    this.sent.push({ ...entry, chainId });
+    if (behavior === 'uncertain-landed') throw new BroadcastUncertainError('Hasil pengiriman tidak pasti: socket hang up');
+  }
+  async transactionStatus(_chainId: number, hash: Hash): Promise<TxStatus> {
+    this.statusCalls++;
+    if (this.statusError) throw new Error('RPC unreachable');
+    const forced = this.statuses.get(hash);
+    if (forced) return forced;
+    return this.sent.some((s) => s.hash === hash) ? 'success' : 'unknown';
   }
   async waitForReceipt(_chainId: number, _hash: Hash): Promise<Receipt> {
     const behavior = this.receipts.shift() ?? 'success';
@@ -120,6 +183,8 @@ export class FakeApi implements O1Api {
   indexedCalls = 0;
   /** tokenIndexed returns true from this call number on (1-based). */
   indexedFromCall = 1;
+  /** Consumed per tokenIndexed call: an entry that is an Error is thrown instead of answering. */
+  indexedFaults: Error[] = [];
   planFactory: PlanFactory;
   quoteImpl: (req: SwapQuoteRequest) => Promise<SwapQuoteResult> = async () => ({ quote_id: 'quote-1', issues: [], steps: [] });
   swapPrepareImpl: (req: SwapPrepareRequest) => Promise<SwapPrepareResult> = async () => {
@@ -139,6 +204,8 @@ export class FakeApi implements O1Api {
   }
   async tokenIndexed() {
     this.indexedCalls++;
+    const fault = this.indexedFaults.shift();
+    if (fault) throw fault;
     return this.indexedCalls >= this.indexedFromCall;
   }
   async prepareLaunch(body: LaunchPrepareRequest, key: string) {

@@ -1,6 +1,7 @@
 import type { Bot } from 'grammy';
 import { CHAINS } from '../chains.js';
 import { formatAmount } from '../domain/units.js';
+import { describeError } from '../errors.js';
 import { code, esc, link, shortAddress } from './format.js';
 import { openLaunchPanel } from './callbacks.js';
 import { Ui, targetOf, type BotDeps } from './panel.js';
@@ -12,6 +13,7 @@ export const COMMAND_LIST = [
   { command: 'launch', description: 'Buat / lanjutkan draft launch' },
   { command: 'wallet', description: 'Alamat & saldo wallet launcher' },
   { command: 'history', description: 'Launch terakhir' },
+  { command: 'dismiss', description: 'Abaikan launch tertunda yang hasilnya tak jelas' },
   { command: 'cancel', description: 'Batalkan input yang sedang berjalan' },
   { command: 'help', description: 'Bantuan' },
   { command: 'id', description: 'Lihat Telegram ID kamu' },
@@ -23,6 +25,7 @@ const HELP = [
   '/launch — buat draft launch (chain, pair, nama, simbol, gambar, sosial, tax, dev buy)',
   '/wallet — alamat &amp; saldo wallet launcher',
   '/history — launch terakhir',
+  '/dismiss — abaikan launch tertunda (hasilnya belum jelas) setelah kamu memeriksanya di explorer',
   '/cancel — batalkan input yang sedang berjalan',
   '/id — lihat Telegram ID kamu',
   '',
@@ -46,6 +49,36 @@ export function registerCommands(bot: Bot<BotContext>, deps: BotDeps, ui: Ui): v
     st.awaiting = null;
     if (st.draft) await ui.show(targetOf(ctx), back);
     else await ctx.reply('Dibatalkan.');
+  });
+
+  bot.command('dismiss', async (ctx) => {
+    if (ctx.state.launching || deps.launcher.isBusy()) return void (await ctx.reply('⏳ Launch sedang berjalan. Coba lagi setelah selesai.'));
+    let pending;
+    try {
+      pending = await deps.launcher.pendingLaunches();
+    } catch (err) {
+      return void (await ctx.reply(`Gagal memeriksa riwayat: ${describeError(err)}`));
+    }
+    if (pending.length === 0) return void (await ctx.reply('✅ Tidak ada launch yang tertunda.'));
+
+    if (ctx.match.trim().toLowerCase() !== 'ya') {
+      const lines = ['⚠️ <b>Launch tertunda</b>', 'Transaksi ini terkirim tetapi hasilnya belum jelas. Periksa di explorer:', ''];
+      for (const row of pending) {
+        const explorer = ui.explorer(row.chainId);
+        const url = row.txHash ? explorer('tx', row.txHash) : null;
+        const label = row.txHash ? shortAddress(row.txHash) : '?';
+        lines.push(`• <b>${esc(row.name ?? '?')}</b> ($${esc(row.symbol ?? '?')}) · ${esc(ui.chainName(row.chainId))} · ${url ? link(label, url) : code(row.txHash ?? '?')}`);
+      }
+      lines.push(
+        '',
+        'Selama ada launch tertunda, launch baru diblokir supaya tidak terjadi dobel.',
+        'Kalau kamu yakin transaksinya tidak akan terkonfirmasi (mis. sudah hilang dari mempool), kirim <code>/dismiss ya</code>.',
+        '<i>Jika ternyata transaksinya berhasil, mengabaikannya berarti kamu bisa membuat launch dobel.</i>',
+      );
+      return void (await ctx.reply(lines.join('\n'), HTML));
+    }
+    const count = await deps.launcher.dismissPending();
+    await ctx.reply(`Diabaikan: ${count} launch tertunda. Kamu bisa /launch lagi.`);
   });
 
   bot.command('wallet', async (ctx) => {

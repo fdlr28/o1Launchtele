@@ -36,6 +36,25 @@ export function secretVariants(...values: string[]): string[] {
   return values.flatMap((value) => (value.startsWith('0x') ? [value, value.slice(2)] : [value]));
 }
 
+/**
+ * The parts of a URL that may be a credential: RPC providers put an API key in the path or the query
+ * (https://host/v2/<key>) or in the userinfo. A plain public endpoint has nothing to hide and stays readable.
+ */
+export function urlSecrets(value: string): string[] {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return [];
+  }
+  const carriesCredential = url.username !== '' || url.password !== '' || url.search !== '' || url.pathname.length > 1;
+  if (!carriesCredential) return [];
+  const parts = new Set<string>([value, url.href, url.username, url.password]);
+  for (const segment of url.pathname.split('/')) if (segment.length >= 12) parts.add(segment);
+  for (const [, v] of url.searchParams) if (v.length >= 8) parts.add(v);
+  return [...parts].filter(Boolean);
+}
+
 function render(value: unknown): string {
   if (value instanceof Error) return value.stack ?? value.message;
   if (typeof value === 'string') return value;
