@@ -10,6 +10,7 @@ import { Catalog } from '../src/o1/catalog.js';
 import { History } from '../src/services/history.js';
 import { Launcher } from '../src/services/launcher.js';
 import { FakeApi, FakeClock, FakeWallet, tempDir } from './fakes.js';
+import { lintOutgoingCall } from './telegram-lint.js';
 
 export const OWNER = 42;
 export const STRANGER = 7;
@@ -71,12 +72,18 @@ export function createHarness() {
   } as never;
   const { bot, store } = createBot(deps, TOKEN, { botInfo });
 
+  /** Errors thrown by handlers or produced by lint. Production routes handler errors to bot.catch(); tests must expect them explicitly. */
+  const errors: unknown[] = [];
   const calls: ApiCall[] = [];
   let nextMessageId = 1000;
   /** Make a Telegram method fail, e.g. { editMessageText: { error_code: 429, description: '...' } }. */
   const faults: Record<string, { error_code: number; description: string } | null> = {};
   bot.api.config.use(async (_prev, method, payload) => {
     calls.push({ method, payload: payload as ApiCall['payload'] });
+    // Anything Telegram would reject (bad HTML, oversize callback data, ...) is a bug in the bot.
+    for (const problem of lintOutgoingCall(method, payload as Record<string, unknown>)) {
+      errors.push(new Error(`Telegram would reject ${method}: ${problem}`));
+    }
     const fault = faults[method];
     if (fault) return { ok: false, ...fault } as never;
     if (method === 'sendMessage') {
@@ -86,8 +93,6 @@ export function createHarness() {
     return { ok: true, result: true } as never;
   });
 
-  /** Errors thrown by handlers. Production routes them to bot.catch(); tests must expect them explicitly. */
-  const errors: unknown[] = [];
   const feed = async (update: unknown) => {
     try {
       await bot.handleUpdate(update as never);

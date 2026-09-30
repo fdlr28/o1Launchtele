@@ -21,12 +21,12 @@ const HELP = [
   '<b>o1 Launch Bot</b> — launch token di o1 Launchpad langsung dari Telegram.',
   '',
   '/launch — buat draft launch (chain, pair, nama, simbol, gambar, sosial, tax, dev buy)',
-  '/wallet — alamat & saldo wallet launcher',
+  '/wallet — alamat &amp; saldo wallet launcher',
   '/history — launch terakhir',
   '/cancel — batalkan input yang sedang berjalan',
   '/id — lihat Telegram ID kamu',
   '',
-  '<b>Alur:</b> /launch → isi field lewat tombol → <b>Review & Launch</b> → konfirmasi.',
+  '<b>Alur:</b> /launch → isi field lewat tombol → <b>Review &amp; Launch</b> → konfirmasi.',
   'Bot menandatangani transaksi dengan wallet launcher; pastikan wallet itu berisi dana untuk creation fee dan gas.',
 ].join('\n');
 

@@ -209,7 +209,7 @@ export function reviewText(draft: Draft, review: Review, chainName: string, wall
     lines.push('', '💸 Fee swap standar o1; bagian creator terkumpul untuk wallet launcher.');
   }
 
-  lines.push('', '💰 <b>Biaya & dana</b>');
+  lines.push('', '💰 <b>Biaya &amp; dana</b>');
   if (ctx?.fee) {
     lines.push(`  Creation fee: ${esc(formatAmount(ctx.fee.amountRaw, ctx.fee.decimals))} ${esc(ctx.fee.symbol)}`);
   } else if (ctx) {
@@ -242,7 +242,7 @@ const STAGE_LABEL: Record<Stage, (detail?: string) => string> = {
   checking: () => '🔎 Memeriksa konfigurasi terbaru…',
   preparing: (d) => `🧪 Menyiapkan launch (upload IPFS, mencari alamat berakhiran 01)…${d ? ` (${esc(d)})` : ''}`,
   approving: () => '✍️ Mengirim approval…',
-  sending: () => '📤 Menandatangani & mengirim transaksi launch…',
+  sending: () => '📤 Menandatangani &amp; mengirim transaksi launch…',
   confirming: () => '⏳ Menunggu konfirmasi block…',
   verifying: () => '🔍 Memverifikasi token di chain…',
   'devbuy-indexing': () => '💰 Dev buy: menunggu token terindeks di API o1…',
