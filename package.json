@@ -11,6 +11,7 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
+    "doctor": "node dist/doctorCli.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },

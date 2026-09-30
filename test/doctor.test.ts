@@ -1,0 +1,149 @@
+import { GrammyError, HttpError } from 'grammy';
+import { describe, expect, it, vi } from 'vitest';
+import { runDoctor, type DoctorDeps } from '../src/doctor.js';
+import { ApiError } from '../src/o1/client.js';
+import type { ChainCheck } from '../src/wallet/wallet.js';
+import { WALLET, configFor } from './fixtures.js';
+
+function makeDeps(overrides: Partial<DoctorDeps> = {}) {
+  const ping = vi.fn(async () => {});
+  const tokenIndexed = vi.fn(async () => false);
+  const getConfig = vi.fn(async (_chain: number, opts: { product: 'tax' | 'non-tax' }) => configFor(opts.product));
+  const deps: DoctorDeps = {
+    config: { allowedUserIds: new Set([1, 2]) },
+    telegramGetMe: async () => ({ username: 'my_bot' }),
+    wallet: {
+      address: WALLET,
+      verifyChains: async (): Promise<ChainCheck[]> => [{ chainId: 8453, ok: true }],
+      nativeBalance: async () => 10n ** 16n,
+    },
+    api: { ping, tokenIndexed, getConfig } as unknown as DoctorDeps['api'],
+    ...overrides,
+  };
+  return { deps, ping, tokenIndexed, getConfig };
+}
+
+const text = (lines: string[]) => lines.join('\n');
+const apiError = (status: number, code: string) => new ApiError(status, code, code, { status, code });
+
+describe('runDoctor', () => {
+  it('reports a fully working setup', async () => {
+    const { deps } = makeDeps();
+    const report = await runDoctor(deps);
+    expect(report.ok).toBe(true);
+    const out = text(report.lines);
+    expect(out).toContain('✅ Telegram: token valid, bot @my_bot');
+    expect(out).toContain('2 user Telegram diizinkan');
+    expect(out).toContain(`Wallet launcher: ${WALLET}`);
+    expect(out).toContain('Base (8453): RPC OK · saldo 0.01 ETH');
+    expect(out).toContain('API o1: key valid (scope config:read OK)');
+    expect(out).toContain('scope tokens:read OK');
+    expect(out).toContain('Base · Tax: siap — 3 pair, creation fee 0.001 ETH');
+    expect(out).toContain('Base · Standard: siap');
+    expect(out).toContain('Siap. Jalankan bot dengan: npm start');
+    expect(out).toContain('launches:prepare, swaps:quote, swaps:prepare tidak bisa dicek');
+  });
+
+  it('fails on a rejected Telegram token', async () => {
+    const { deps } = makeDeps({
+      telegramGetMe: async () => {
+        throw new GrammyError('getMe failed', { ok: false, error_code: 401, description: 'Unauthorized' }, 'getMe', {});
+      },
+    });
+    const report = await runDoctor(deps);
+    expect(report.ok).toBe(false);
+    expect(text(report.lines)).toContain('❌ Telegram: token ditolak (401)');
+  });
+
+  it('fails when Telegram is unreachable', async () => {
+    const { deps } = makeDeps({
+      telegramGetMe: async () => {
+        throw new HttpError('Network request failed', new Error('connect ECONNREFUSED'));
+      },
+    });
+    const report = await runDoctor(deps);
+    expect(report.ok).toBe(false);
+    expect(text(report.lines)).toContain('tidak bisa terhubung ke api.telegram.org');
+  });
+
+  it('stops early when no chain has a working RPC (and does not spend API calls)', async () => {
+    const { deps, ping, getConfig } = makeDeps({
+      wallet: {
+        address: WALLET,
+        verifyChains: async () => [{ chainId: 8453, ok: false, error: 'RPC mengembalikan chain id 1, seharusnya 8453' }],
+        nativeBalance: async () => 0n,
+      },
+    });
+    const report = await runDoctor(deps);
+    expect(report.ok).toBe(false);
+    expect(text(report.lines)).toContain('Base (8453): RPC bermasalah: RPC mengembalikan chain id 1');
+    expect(text(report.lines)).toContain('Tidak ada chain yang bisa dipakai');
+    expect(ping).not.toHaveBeenCalled();
+    expect(getConfig).not.toHaveBeenCalled();
+  });
+
+  it('only warns about an empty balance', async () => {
+    const { deps } = makeDeps({
+      wallet: { address: WALLET, verifyChains: async () => [{ chainId: 8453, ok: true }], nativeBalance: async () => 0n },
+    });
+    const report = await runDoctor(deps);
+    expect(report.ok).toBe(true);
+    expect(text(report.lines)).toContain('⚠️ Base (8453): RPC OK, tetapi saldo 0');
+  });
+
+  it('keeps going with the healthy chains when another chain is broken', async () => {
+    const { deps, getConfig } = makeDeps({
+      wallet: {
+        address: WALLET,
+        verifyChains: async () => [
+          { chainId: 8453, ok: true },
+          { chainId: 56, ok: false, error: 'HTTP request failed.' },
+        ],
+        nativeBalance: async () => 10n ** 18n,
+      },
+    });
+    const report = await runDoctor(deps);
+    expect(report.ok).toBe(false); // a configured chain is broken: surface it
+    expect(text(report.lines)).toContain('BSC (56): RPC bermasalah');
+    expect(getConfig.mock.calls.every(([chain]) => chain === 8453)).toBe(true);
+  });
+
+  it('fails on a rejected API key and skips the follow-up probes', async () => {
+    const { deps, tokenIndexed, getConfig } = makeDeps();
+    (deps.api.ping as ReturnType<typeof vi.fn>).mockRejectedValue(apiError(401, 'invalid_api_key'));
+    const report = await runDoctor(deps);
+    expect(report.ok).toBe(false);
+    expect(text(report.lines)).toContain('API o1: key ditolak (invalid_api_key)');
+    expect(tokenIndexed).not.toHaveBeenCalled();
+    expect(getConfig).not.toHaveBeenCalled();
+  });
+
+  it('fails when the key lacks tokens:read', async () => {
+    const { deps, tokenIndexed } = makeDeps();
+    tokenIndexed.mockRejectedValue(apiError(403, 'insufficient_scope'));
+    const report = await runDoctor(deps);
+    expect(report.ok).toBe(false);
+    expect(text(report.lines)).toContain('belum punya scope tokens:read');
+  });
+
+  it('warns when a product is not available for new launches on a chain', async () => {
+    const { deps } = makeDeps();
+    (deps.api.getConfig as ReturnType<typeof vi.fn>).mockImplementation(async (_c: number, opts: { product: 'tax' | 'non-tax' }) => {
+      const cfg = configFor(opts.product);
+      if (opts.product === 'tax') cfg.suites![0]!.creation_available = false;
+      return cfg;
+    });
+    const report = await runDoctor(deps);
+    expect(report.ok).toBe(true);
+    expect(text(report.lines)).toContain('⚠️ Base · Tax: belum tersedia untuk launch baru');
+    expect(text(report.lines)).toContain('✅ Base · Standard: siap');
+  });
+
+  it('degrades to warnings when the catalog cannot be loaded', async () => {
+    const { deps } = makeDeps();
+    (deps.api.getConfig as ReturnType<typeof vi.fn>).mockRejectedValue(apiError(503, 'temporarily_unavailable'));
+    const report = await runDoctor(deps);
+    expect(report.ok).toBe(true);
+    expect(text(report.lines)).toContain('⚠️ Base · Tax: konfigurasi tidak bisa dimuat');
+  });
+});

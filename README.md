@@ -43,21 +43,38 @@ API o1 tidak pernah menandatangani atau broadcast apa pun; bot yang melakukannya
 
 ## Menjalankan
 
+Bot harus jalan di **mesin atau server milikmu sendiri** (PC, VPS, atau HP dengan Termux), bukan di sesi Claude Code
+cloud: kunci privat tidak seharusnya masuk ke sana, dan bot perlu jalan terus-menerus.
+
 ```bash
+git clone --branch claude/eager-clarke-wbiki8 https://github.com/fdlr28/o1Launchtele.git
+cd o1Launchtele
 npm install
 cp .env.example .env      # isi minimal TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, PRIVATE_KEY, O1_API_KEY
 npm run build
+npm run doctor            # cek semua persiapan (tidak mengirim transaksi apa pun)
 npm start
 ```
+
+**`npm run doctor`** memeriksa: format `.env`, token Telegram, RPC tiap chain (chain id harus cocok) beserta saldo
+wallet, API key o1 (`config:read` dan `tokens:read`), dan apakah launch Tax/Standard tersedia di tiap chain
+(jumlah pair dan creation fee). Hasilnya tidak memuat nilai rahasia, jadi aman ditempel kalau kamu butuh bantuan.
+Scope `launches:prepare`, `swaps:quote`, dan `swaps:prepare` tidak bisa dicek tanpa efek samping, jadi pastikan sendiri
+key-mu punya ketiganya.
 
 Untuk pengembangan: `npm run dev` (auto-reload). Agar tetap hidup di server, jalankan dengan `pm2`, `systemd`, atau
 sejenisnya. Bot memakai long-polling, jadi tidak perlu domain atau webhook.
 
-**Tidak tahu Telegram ID-mu?** Isi `ALLOWED_USER_IDS` dengan angka apa pun, jalankan bot, kirim `/id` ke bot
+**Di HP (Termux):** `pkg install nodejs git`, lalu ikuti langkah di atas. Aktifkan `termux-wake-lock` supaya proses tidak
+dimatikan saat layar padam. VPS kecil lebih andal untuk pemakaian rutin.
+
+**Tidak tahu Telegram ID-mu?** Isi `ALLOWED_USER_IDS` dengan angka apa pun (mis. `1`), jalankan bot, kirim `/id` ke bot
 (perintah ini boleh dipakai siapa saja), lalu isi ID yang muncul dan restart.
 
 Saat start, bot memeriksa: konfigurasi `.env`, RPC tiap chain (chain id harus cocok, kalau tidak chain itu
 dinonaktifkan), dan API key o1.
+
+**Memperbarui:** `git pull && npm install && npm run build`, lalu restart bot.
 
 ## Cara pakai
 
@@ -155,6 +172,7 @@ npm test            # vitest
 ```
 src/
   index.ts            # entry: config, verifikasi RPC + API key, start bot
+  doctor.ts           # pemeriksaan setup (npm run doctor); doctorCli.ts = entry CLI-nya
   config.ts           # validasi .env (semua error sekaligus)
   chains.ts           # daftar chain, RPC/explorer bawaan
   logger.ts           # log dengan sensor rahasia
